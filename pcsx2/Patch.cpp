@@ -23,8 +23,10 @@
 
 #include <memory>
 #include <vector>
+#include <map>
 #include <wx/textfile.h>
 #include <wx/dir.h>
+#include <wx/filename.h>
 #include <wx/txtstrm.h>
 #include <wx/zipstrm.h>
 #include <wx/wfstream.h>
@@ -255,6 +257,13 @@ int LoadPatchesFromDir(wxString name, const wxDirName& folderName, const wxStrin
 	}
 
 	PatchesCon->WriteLn((loaded ? Color_Green : Color_Gray), L"Overall %d %s loaded", loaded, WX_STR(friendlyName));
+
+	// Establish/refresh the on-disk signature baseline for this crc+folder right
+	// after a real load, so CheckAndReloadCheatsIfChanged()'s periodic poll (via
+	// PatchSourceChangedOnDisk()) doesn't immediately think something changed and
+	// redundantly reload what was just loaded here.
+	PatchSourceChangedOnDisk(name, folderName);
+
 	return loaded;
 }
 
@@ -270,6 +279,79 @@ static u64 StrToU64(const wxString& str, int base = 10)
 	wxULongLong_t l;
 	str.ToULongLong(&l, base);
 	return l;
+}
+
+// --------------------------------------------------------------------------------
+//  PatchSourceChangedOnDisk
+// --------------------------------------------------------------------------------
+// Lightweight signature of a patch source's matching files, used to detect edits
+// made outside of PCSX2 (e.g. someone regenerating a .pnach with an external tool)
+// without needing an OS-level file watch handle kept open.
+namespace
+{
+	struct PatchSourceSignature
+	{
+		int fileCount = 0;
+		wxULongLong totalSize = 0;
+		wxDateTime latestMTime;
+
+		bool operator!=(const PatchSourceSignature& other) const
+		{
+			return fileCount != other.fileCount ||
+				   totalSize != other.totalSize ||
+				   (latestMTime.IsValid() != other.latestMTime.IsValid()) ||
+				   (latestMTime.IsValid() && latestMTime != other.latestMTime);
+		}
+	};
+
+	// Keyed by "<CRC>|<folder path>" so each game/source-folder pair (cheats vs
+	// widescreen cheats) tracks its own independent baseline.
+	static std::map<wxString, PatchSourceSignature> s_patchSourceSignatures;
+} // namespace
+
+bool PatchSourceChangedOnDisk(const wxString& crc, const wxDirName& folderName)
+{
+	if (!folderName.Exists())
+		return false;
+
+	wxString upperCrc(crc);
+	upperCrc.MakeUpper();
+	const wxString fileSpec = upperCrc + L"*.PNACH";
+
+	PatchSourceSignature current;
+
+	wxDir dir(folderName.ToString());
+	wxString buffer;
+	bool found = dir.IsOpened() && dir.GetFirst(&buffer, L"*", wxDIR_FILES);
+	while (found)
+	{
+		if (buffer.Upper().Matches(fileSpec))
+		{
+			wxFileName fn(Path::Combine(folderName, buffer));
+			if (fn.FileExists())
+			{
+				current.fileCount++;
+				current.totalSize += fn.GetSize();
+
+				wxDateTime mtime = fn.GetModificationTime();
+				if (mtime.IsValid() && (!current.latestMTime.IsValid() || mtime > current.latestMTime))
+					current.latestMTime = mtime;
+			}
+		}
+		found = dir.GetNext(&buffer);
+	}
+
+	const wxString key = upperCrc + L"|" + folderName.ToString();
+
+	auto it = s_patchSourceSignatures.find(key);
+	const bool changed = (it != s_patchSourceSignatures.end()) && (it->second != current);
+
+	// Always (re)store the freshly-scanned signature as the new baseline, whether
+	// this was the first check for this crc+folder (nothing to diff against yet,
+	// so changed stays false) or a later one.
+	s_patchSourceSignatures[key] = current;
+
+	return changed;
 }
 
 // PatchFunc Functions.

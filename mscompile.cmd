@@ -15,11 +15,11 @@ REM If not, see <http://www.gnu.org/licenses/>.
 
 CLS
 ECHO Select your Visual Studio version:
-ECHO 1. Microsoft Visual Studio 2019
+ECHO 1. Microsoft Visual Studio Community 2026 (v18)
 ECHO Q. Exit the script.
 CHOICE /C 1Q /T 10 /D 1 /M "Visual Studio version: "
 IF ERRORLEVEL 2 GOTO END
-IF ERRORLEVEL 1 SET "VCVARPATH=%VS160COMNTOOLS%..\..\VC\Auxiliary\Build\vcvarsall.bat"
+IF ERRORLEVEL 1 SET "VCVARPATH=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat"
 
 ECHO.
 ECHO Select the desired configuration:
@@ -56,6 +56,7 @@ GOTO END
 :ERRORVS
 ECHO.
 ECHO The selected Visual Studio version was not found.
+ECHO Path checked: "%VCVARPATH%"
 
 :END
 ECHO.

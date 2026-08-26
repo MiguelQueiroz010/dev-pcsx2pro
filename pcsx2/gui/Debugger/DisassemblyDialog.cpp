@@ -15,6 +15,12 @@
 
 #include "PrecompiledHeader.h"
 
+#include <algorithm>
+#include <map>
+#include <set>
+#include <functional>
+#include <cwctype>
+
 #include "gui/App.h"
 #include "gui/MainFrame.h"
 #include "DisassemblyDialog.h"
@@ -23,12 +29,22 @@
 #include "DebugTools/Breakpoints.h"
 #include "DebugTools/MipsStackWalk.h"
 #include "BreakpointWindow.h"
+#include "GameDebuggerConfigDialog.h"
+#include "DebugTools/GameDebuggerConfig.h"
 #include "PathDefs.h"
 #include "wx/busyinfo.h"
 
 #ifdef _WIN32
 #include <Windows.h>
 #endif
+
+namespace
+{
+	enum DisassemblyDialogAcceleratorIdentifiers
+	{
+		ID_DISASM_FOCUSFUNCTIONSEARCH = wxID_HIGHEST + 1,
+	};
+}
 
 wxBEGIN_EVENT_TABLE(DisassemblyDialog, wxFrame)
    EVT_COMMAND( wxID_ANY, debEVT_SETSTATUSBARTEXT, DisassemblyDialog::onDebuggerEvent )
@@ -49,7 +65,6 @@ wxBEGIN_EVENT_TABLE(DisassemblyDialog, wxFrame)
 wxEND_EVENT_TABLE()
 
 wxBEGIN_EVENT_TABLE(CpuTabPage, wxPanel)
-	EVT_LISTBOX_DCLICK( wxID_ANY, CpuTabPage::listBoxHandler)
 wxEND_EVENT_TABLE()
 
 DebuggerHelpDialog::DebuggerHelpDialog(wxWindow* parent)
@@ -89,7 +104,51 @@ CpuTabPage::CpuTabPage(wxWindow* parent, DebugInterface* _cpu)
 	bottomTabs = new wxNotebook(this, wxID_ANY);
 	disassembly = new CtrlDisassemblyView(this, cpu);
 	registerList = new CtrlRegisterList(leftTabs, cpu);
-	functionList = new wxListBox(leftTabs, wxID_ANY, wxDefaultPosition, wxDefaultSize, 0, NULL, wxBORDER_NONE | wxLB_SORT);
+
+	// Aba "Functions": toolbar (choice de agrupamento + busca) em cima de uma
+	// wxTreeCtrl. A árvore substitui a antiga wxListBox plana/ordenada porque
+	// ela sozinha não suporta cabeçalhos de grupo (Nome/Região).
+	functionsPanel = new wxPanel(leftTabs);
+	wxBoxSizer* functionsSizer = new wxBoxSizer(wxVERTICAL);
+
+	wxBoxSizer* functionsToolbar = new wxBoxSizer(wxHORIZONTAL);
+	functionGroupChoice = new wxChoice(functionsPanel, wxID_ANY);
+	functionGroupChoice->Append(L"Group: Name");
+	functionGroupChoice->Append(L"Group: Region");
+	functionGroupChoice->SetSelection(GROUP_BY_NAME);
+	functionsToolbar->Add(functionGroupChoice, 1, wxEXPAND | wxRIGHT, 2);
+
+	functionSearchBox = new wxTextCtrl(functionsPanel, wxID_ANY, wxEmptyString,
+		wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
+	functionSearchBox->SetHint(L"Search (Ctrl+F)");
+	functionsToolbar->Add(functionSearchBox, 1, wxEXPAND);
+
+	functionsSizer->Add(functionsToolbar, 0, wxEXPAND | wxALL, 2);
+
+	functionTree = new wxTreeCtrl(functionsPanel, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+		wxTR_HAS_BUTTONS | wxTR_LINES_AT_ROOT | wxTR_SINGLE | wxTR_HIDE_ROOT | wxBORDER_NONE);
+	functionsSizer->Add(functionTree, 1, wxEXPAND);
+
+	// Segunda árvore, só pra resultado de busca, ocupando o MESMO espaço no
+	// sizer (Show()/Hide() alterna qual aparece). Existe porque reconstruir
+	// a árvore agrupada inteira (functionTree, que pode ter milhares de
+	// itens) a cada tecla digitada na busca era o que deixava a busca lenta
+	// e "piscando" -- agora só a árvore de busca (sempre uma lista plana,
+	// naturalmente menor que o total) é reconstruída por tecla, e a
+	// agrupada fica intacta em memória, pronta pra reaparecer sem
+	// recalcular nada assim que a busca é limpa.
+	functionSearchTree = new wxTreeCtrl(functionsPanel, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+		wxTR_HAS_BUTTONS | wxTR_LINES_AT_ROOT | wxTR_SINGLE | wxTR_HIDE_ROOT | wxBORDER_NONE);
+	functionsSizer->Add(functionSearchTree, 1, wxEXPAND);
+	functionSearchTree->Hide();
+
+	functionsPanel->SetSizer(functionsSizer);
+
+	functionGroupChoice->Bind(wxEVT_CHOICE, &CpuTabPage::onFunctionGroupChoice, this);
+	functionSearchBox->Bind(wxEVT_TEXT, &CpuTabPage::onFunctionSearchText, this);
+	functionSearchBox->Bind(wxEVT_KEY_DOWN, &CpuTabPage::onFunctionSearchKeyDown, this);
+	functionTree->Bind(wxEVT_TREE_ITEM_ACTIVATED, &CpuTabPage::onFunctionTreeActivated, this);
+	functionSearchTree->Bind(wxEVT_TREE_ITEM_ACTIVATED, &CpuTabPage::onFunctionTreeActivated, this);
 
 	wxPanel* memoryPanel = new wxPanel(bottomTabs);
 	memory = new CtrlMemView(memoryPanel, cpu);
@@ -103,7 +162,7 @@ CpuTabPage::CpuTabPage(wxWindow* parent, DebugInterface* _cpu)
 	miscStuffSizer->Add(cyclesText, 0, wxLEFT | wxTOP | wxBOTTOM, 2);
 
 	leftTabs->AddPage(registerList, L"Registers");
-	leftTabs->AddPage(functionList, L"Functions");
+	leftTabs->AddPage(functionsPanel, L"Functions");
 
 	wxBoxSizer* registerSizer = new wxBoxSizer(wxVERTICAL);
 	registerSizer->Add(miscStuffSizer, 0);
@@ -145,6 +204,7 @@ CpuTabPage::CpuTabPage(wxWindow* parent, DebugInterface* _cpu)
 	mainSizer->Layout();
 
 	symbolCount = 0;
+	lastSymGeneration_ = 0;
 
 	lastCycles = 0;
 	loadCycles();
@@ -153,31 +213,366 @@ CpuTabPage::CpuTabPage(wxWindow* parent, DebugInterface* _cpu)
 void CpuTabPage::clearSymbolMap()
 {
 	symbolCount = 0;
-	functionList->Clear();
+	lastSymGeneration_ = 0;
+	allFunctions_.clear();
+	allLabels_.clear();
+	groupedTreeBuilt_ = false;
+	functionTree->DeleteAllItems();
+	functionSearchTree->DeleteAllItems();
 }
 
 void CpuTabPage::reloadSymbolMap()
 {
-	if (!symbolCount)
+	u32 currentGeneration = cpu->GetSymbolMap().GetGeneration();
+	if (symbolCount == 0 || currentGeneration != lastSymGeneration_)
 	{
-		auto funcs = cpu->GetSymbolMap().GetAllSymbols(ST_FUNCTION);
-		symbolCount = funcs.size();
-		for (size_t i = 0; i < funcs.size(); i++)
-		{
-			wxString name = wxString(funcs[i].name.c_str(), wxConvUTF8);
-			functionList->Append(name, reinterpret_cast<void*>(static_cast<uintptr_t>(funcs[i].address)));
-		}
+		allFunctions_ = cpu->GetSymbolMap().GetAllSymbols(ST_FUNCTION);
+		allLabels_ = cpu->GetSymbolMap().GetAllSymbols(ST_LABEL);
+		symbolCount = allFunctions_.size();
+		lastSymGeneration_ = currentGeneration;
+		// Símbolos mudaram de verdade (novo overlay, .sym recarregado, etc.)
+		// -- a árvore agrupada em cache não reflete mais a realidade, então
+		// força reconstrução da próxima vez que rebuildFunctionTree() olhar
+		// pra ela (imediatamente, se não estiver em busca no momento).
+		groupedTreeBuilt_ = false;
+		rebuildFunctionTree();
 	}
 }
 
-void CpuTabPage::listBoxHandler(wxCommandEvent& event)
+void CpuTabPage::rebuildFunctionTree()
 {
-	int index = functionList->GetSelection();
-	if (event.GetEventObject() == functionList && index >= 0)
+	wxString filter = functionSearchBox->GetValue();
+
+	if (!filter.IsEmpty())
 	{
-		uptr pos = (uptr)functionList->GetClientData(index);
-		postEvent(debEVT_GOTOINDISASM, pos);
+		// Busca: só a árvore de busca (sempre pequena, plana) é reconstruída.
+		// A agrupada (functionTree, que pode ter milhares de itens) nem é
+		// tocada -- é só trocar qual das duas está visível no sizer.
+		populateFunctionTreeFiltered(filter);
+		if (!functionSearchTree->IsShown())
+		{
+			functionTree->Hide();
+			functionSearchTree->Show();
+			functionsPanel->Layout();
+		}
+		return;
 	}
+
+	// Sem busca: garante que a árvore agrupada existe (só reconstrói de
+	// verdade se estiver marcada "suja" -- primeira vez, mudança de
+	// agrupamento, ou símbolos recarregados -- nunca só por causa de ter
+	// digitado e apagado algo na busca).
+	if (!groupedTreeBuilt_)
+	{
+		std::set<wxString> expandedKeys;
+		u32 selectedAddress = SymbolMap::INVALID_ADDRESS;
+		captureFunctionTreeState(expandedKeys, selectedAddress);
+
+		populateFunctionTreeGrouped();
+		groupedTreeBuilt_ = true;
+
+		restoreFunctionTreeState(expandedKeys, selectedAddress);
+	}
+
+	if (!functionTree->IsShown())
+	{
+		functionSearchTree->Hide();
+		functionTree->Show();
+		functionsPanel->Layout();
+	}
+}
+
+// Chave estável de um nó através de um rebuild:
+//  - cabeçalho de grupo ("A (12)", "BATTLE (5414)", "Labels (3)") -> o texto
+//    sem o sufixo " (N)", já que a contagem muda a cada rebuild mas o nome
+//    do grupo não;
+//  - função/label -> endereço em hex, que é único e não muda.
+wxString CpuTabPage::functionTreeNodeKey(const wxTreeItemId& item, FunctionTreeItemData* data)
+{
+	if (data->isGroupHeader)
+	{
+		wxString text = functionTree->GetItemText(item);
+		int paren = text.Find(L" (");
+		return paren != wxNOT_FOUND ? text.Left(paren) : text;
+	}
+	return wxString::Format(L"%08X", data->address);
+}
+
+void CpuTabPage::captureFunctionTreeState(std::set<wxString>& expandedKeys, u32& selectedAddress)
+{
+	expandedKeys.clear();
+	selectedAddress = SymbolMap::INVALID_ADDRESS;
+
+	wxTreeItemId root = functionTree->GetRootItem();
+	if (!root.IsOk())
+		return;
+
+	wxTreeItemId selected = functionTree->GetSelection();
+
+	std::function<void(const wxTreeItemId&)> walk = [&](const wxTreeItemId& parent)
+	{
+		wxTreeItemIdValue cookie;
+		for (wxTreeItemId child = functionTree->GetFirstChild(parent, cookie); child.IsOk();
+			child = functionTree->GetNextChild(parent, cookie))
+		{
+			FunctionTreeItemData* data = static_cast<FunctionTreeItemData*>(functionTree->GetItemData(child));
+			if (data != NULL)
+			{
+				if (functionTree->ItemHasChildren(child) && functionTree->IsExpanded(child))
+					expandedKeys.insert(functionTreeNodeKey(child, data));
+
+				if (child == selected && !data->isGroupHeader)
+					selectedAddress = data->address;
+			}
+			walk(child);
+		}
+	};
+	walk(root);
+}
+
+void CpuTabPage::restoreFunctionTreeState(const std::set<wxString>& expandedKeys, u32 selectedAddress)
+{
+	wxTreeItemId root = functionTree->GetRootItem();
+	if (!root.IsOk())
+		return;
+
+	wxTreeItemId toSelect;
+
+	std::function<void(const wxTreeItemId&)> walk = [&](const wxTreeItemId& parent)
+	{
+		wxTreeItemIdValue cookie;
+		for (wxTreeItemId child = functionTree->GetFirstChild(parent, cookie); child.IsOk();
+			child = functionTree->GetNextChild(parent, cookie))
+		{
+			FunctionTreeItemData* data = static_cast<FunctionTreeItemData*>(functionTree->GetItemData(child));
+			if (data != NULL)
+			{
+				if (functionTree->ItemHasChildren(child) && expandedKeys.count(functionTreeNodeKey(child, data)))
+					functionTree->Expand(child);
+
+				if (!data->isGroupHeader && selectedAddress != SymbolMap::INVALID_ADDRESS && data->address == selectedAddress)
+					toSelect = child;
+			}
+			walk(child);
+		}
+	};
+	walk(root);
+
+	if (toSelect.IsOk())
+	{
+		functionTree->SelectItem(toSelect);
+		functionTree->EnsureVisible(toSelect);
+	}
+}
+
+void CpuTabPage::populateFunctionTreeGrouped()
+{
+	functionTree->Freeze();
+	functionTree->DeleteAllItems();
+	wxTreeItemId root = functionTree->AddRoot(L"Functions");
+
+	FunctionGroupMode mode = (FunctionGroupMode)functionGroupChoice->GetSelection();
+
+	// std::map com chave wxString mantém os grupos ordenados alfabeticamente
+	// de graça (A, B, C... ou os nomes de módulo/overlay em ordem, com "ELF"
+	// primeiro por vir antes de qualquer nome de overlay em ordenação ASCII
+	// -- 'E' < a maioria das letras de nomes de overlay reais, mas não é
+	// garantido; não é crítico, é só ordem de exibição).
+	std::map<wxString, std::vector<const SymbolEntry*>> groups;
+
+	// Classifica cada label usando GetFunctionStart(), que já faz o
+	// range-lookup certo (não precisa reimplementar busca por endereço):
+	//  - funcStart == label.address  -> é só o espelho automático que
+	//    AddFunction() grava via AddLabel() no mesmo endereço da função;
+	//    descarta aqui pra não duplicar o próprio nó da função.
+	//  - funcStart == INVALID_ADDRESS -> label solto (fora de qualquer
+	//    função conhecida), ex.: MODO_BATTLE.
+	//  - qualquer outro caso -> label dentro do corpo de uma função, vira
+	//    filho dela na árvore.
+	std::map<u32, std::vector<const SymbolEntry*>> labelsByFunction;
+	std::vector<const SymbolEntry*> soloLabels;
+	for (const SymbolEntry& label : allLabels_)
+	{
+		u32 funcStart = cpu->GetSymbolMap().GetFunctionStart(label.address);
+		if (funcStart == SymbolMap::INVALID_ADDRESS)
+			soloLabels.push_back(&label);
+		else if (funcStart != label.address)
+			labelsByFunction[funcStart].push_back(&label);
+	}
+
+	for (const SymbolEntry& func : allFunctions_)
+	{
+		wxString key;
+		if (mode == GROUP_BY_NAME)
+		{
+			wxString name = wxString(func.name.c_str(), wxConvUTF8);
+			wchar_t first = !name.IsEmpty() ? towupper(name[0]) : L'#';
+			key = (first >= L'A' && first <= L'Z') ? wxString(1, first) : wxString(L"#");
+		}
+		else // GROUP_BY_REGION
+		{
+			key = wxString(cpu->GetSymbolMap().GetModuleName(func.moduleIndex).c_str(), wxConvUTF8);
+		}
+		groups[key].push_back(&func);
+	}
+
+	for (auto& group : groups)
+	{
+		wxTreeItemId header = functionTree->AppendItem(root,
+			wxString::Format(L"%s (%zu)", group.first, group.second.size()),
+			-1, -1, new FunctionTreeItemData(0, true));
+
+		// Dentro de cada grupo, ordena por nome (Ordem alfab.) independente
+		// do modo -- agrupar por Região ainda lista as funções de cada
+		// overlay em ordem de nome, não em ordem de endereço.
+		std::sort(group.second.begin(), group.second.end(),
+			[](const SymbolEntry* a, const SymbolEntry* b) { return a->name < b->name; });
+
+		for (const SymbolEntry* func : group.second)
+		{
+			wxString name = wxString(func->name.c_str(), wxConvUTF8);
+			wxTreeItemId funcItem = functionTree->AppendItem(header, name, -1, -1, new FunctionTreeItemData(func->address));
+
+			auto labelsIt = labelsByFunction.find(func->address);
+			if (labelsIt != labelsByFunction.end())
+			{
+				std::sort(labelsIt->second.begin(), labelsIt->second.end(),
+					[](const SymbolEntry* a, const SymbolEntry* b) { return a->address < b->address; });
+
+				for (const SymbolEntry* label : labelsIt->second)
+				{
+					wxString labelName = wxString(label->name.c_str(), wxConvUTF8);
+					functionTree->AppendItem(funcItem, labelName, -1, -1, new FunctionTreeItemData(label->address));
+				}
+			}
+		}
+	}
+
+	// Separador pros labels que não caem dentro de nenhuma função conhecida
+	// (ex.: MODO_BATTLE) -- seção própria no fim da árvore, fora do
+	// agrupamento por Nome/Região, pra não ficar escondido misturado no meio
+	// dos grupos alfabéticos.
+	if (!soloLabels.empty())
+	{
+		std::sort(soloLabels.begin(), soloLabels.end(),
+			[](const SymbolEntry* a, const SymbolEntry* b) { return a->name < b->name; });
+
+		wxTreeItemId labelsHeader = functionTree->AppendItem(root,
+			wxString::Format(L"Labels (%zu)", soloLabels.size()),
+			-1, -1, new FunctionTreeItemData(0, true));
+
+		for (const SymbolEntry* label : soloLabels)
+		{
+			wxString name = wxString(label->name.c_str(), wxConvUTF8);
+			functionTree->AppendItem(labelsHeader, name, -1, -1, new FunctionTreeItemData(label->address));
+		}
+	}
+
+	functionTree->Thaw();
+}
+
+void CpuTabPage::populateFunctionTreeFiltered(const wxString& filter)
+{
+	functionSearchTree->Freeze();
+	functionSearchTree->DeleteAllItems();
+	wxTreeItemId root = functionSearchTree->AddRoot(L"Functions");
+
+	wxString needle = filter.Lower();
+
+	// Busca ignora agrupamento de propósito -- lista plana ordenada por nome,
+	// só com o que bate a substring (case-insensitive), pra achar rápido sem
+	// ter que expandir grupo por grupo.
+	std::vector<const SymbolEntry*> matches;
+	for (const SymbolEntry& func : allFunctions_)
+	{
+		wxString name = wxString(func.name.c_str(), wxConvUTF8);
+		if (name.Lower().Find(needle) != wxNOT_FOUND)
+			matches.push_back(&func);
+	}
+	for (const SymbolEntry& label : allLabels_)
+	{
+		// Pula o espelho automático que AddFunction() grava via AddLabel() no
+		// mesmo endereço -- essa função já foi (ou será) encontrada no loop
+		// acima, não precisa duplicar a entrada aqui.
+		if (cpu->GetSymbolMap().GetFunctionStart(label.address) == label.address)
+			continue;
+
+		wxString name = wxString(label.name.c_str(), wxConvUTF8);
+		if (name.Lower().Find(needle) != wxNOT_FOUND)
+			matches.push_back(&label);
+	}
+
+	std::sort(matches.begin(), matches.end(),
+		[](const SymbolEntry* a, const SymbolEntry* b) { return a->name < b->name; });
+
+	for (const SymbolEntry* func : matches)
+	{
+		wxString name = wxString(func->name.c_str(), wxConvUTF8);
+		functionSearchTree->AppendItem(root, name, -1, -1, new FunctionTreeItemData(func->address));
+	}
+
+	functionSearchTree->Thaw();
+}
+
+void CpuTabPage::onFunctionGroupChoice(wxCommandEvent& evt)
+{
+	// Mudança de agrupamento é uma ação explícita do usuário -- vale a pena
+	// reconstruir a árvore agrupada de verdade (diferente de digitar na
+	// busca, que não deveria tocar nela).
+	groupedTreeBuilt_ = false;
+	rebuildFunctionTree();
+}
+
+void CpuTabPage::onFunctionSearchText(wxCommandEvent& evt)
+{
+	rebuildFunctionTree();
+}
+
+void CpuTabPage::onFunctionSearchKeyDown(wxKeyEvent& evt)
+{
+	if (evt.GetKeyCode() == WXK_ESCAPE)
+	{
+		functionSearchBox->Clear();
+		rebuildFunctionTree();
+	}
+	else
+	{
+		evt.Skip();
+	}
+}
+
+void CpuTabPage::onFunctionTreeActivated(wxTreeEvent& evt)
+{
+	wxTreeCtrl* tree = static_cast<wxTreeCtrl*>(evt.GetEventObject());
+	FunctionTreeItemData* data = static_cast<FunctionTreeItemData*>(tree->GetItemData(evt.GetItem()));
+	if (data && data->isGroupHeader)
+	{
+		// Duplo-clique/Enter num cabeçalho de grupo expande/colapsa em vez
+		// de tentar ir pra um endereço que não existe. (Só functionTree tem
+		// cabeçalhos de grupo; functionSearchTree é sempre lista plana.)
+		if (tree->IsExpanded(evt.GetItem()))
+			tree->Collapse(evt.GetItem());
+		else
+			tree->Expand(evt.GetItem());
+		return;
+	}
+
+	if (data)
+		postEvent(debEVT_GOTOINDISASM, data->address);
+}
+
+void CpuTabPage::focusFunctionSearch()
+{
+	for (size_t i = 0; i < leftTabs->GetPageCount(); i++)
+	{
+		if (leftTabs->GetPage(i) == functionsPanel)
+		{
+			leftTabs->SetSelection(i);
+			break;
+		}
+	}
+	functionSearchBox->SetFocus();
+	functionSearchBox->SelectAll();
 }
 
 void CpuTabPage::postEvent(wxEventType type, int value)
@@ -204,6 +599,13 @@ void CpuTabPage::setBottomTabPage(wxWindow* win)
 void CpuTabPage::update()
 {
 	breakpointList->reloadBreakpoints();
+
+	// Pega qualquer módulo/overlay que o GameDebuggerConfigManager tenha
+	// carregado sozinho em background (troca de overlay durante a execução,
+	// sem passar pelo botão "Game Overlays Symbols" nem por debEVT_MAPLOADED).
+	// reloadSymbolMap() já é barato quando a geração não mudou -- só essa
+	// comparação de u32 -- então chamar em todo update() do render é seguro.
+	reloadSymbolMap();
 
 	if (threadList != NULL && cpu->isAlive())
 	{
@@ -281,6 +683,10 @@ DisassemblyDialog::DisassemblyDialog(wxWindow* parent) :
 	Bind(wxEVT_BUTTON, &DisassemblyDialog::onBreakpointClicked, this, breakpointButton->GetId());
 	topRowSizer->Add(breakpointButton);
 
+	gameConfigButton = new wxButton(panel, wxID_ANY, L"Game Overlays & Symbols");
+	Bind(wxEVT_BUTTON, &DisassemblyDialog::onGameConfigClicked, this, gameConfigButton->GetId());
+	topRowSizer->Add(gameConfigButton);
+
 	helpButton = new wxButton(panel, wxID_ANY, L"Help");
 	Bind(wxEVT_BUTTON, &DisassemblyDialog::onHelpClicked, this, helpButton->GetId());
 	topRowSizer->Add(helpButton);
@@ -297,6 +703,16 @@ DisassemblyDialog::DisassemblyDialog(wxWindow* parent) :
 	Bind(wxEVT_NOTEBOOK_PAGE_CHANGED, &DisassemblyDialog::onPageChanging, this, middleBook->GetId());
 	topSizer->Add(middleBook, 3, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 3);
 	currentCpu = eeTab;
+
+	// Ctrl+F funciona a qualquer momento dentro da aba da CPU (disassembler,
+	// registradores, etc.), não só quando o foco já está na busca -- troca
+	// pra aba Functions e foca a caixa de busca. wxAcceleratorTable num
+	// wxFrame intercepta o atalho pra qualquer janela filha que tenha foco.
+	wxAcceleratorEntry accelEntries[1];
+	accelEntries[0].Set(wxACCEL_CTRL, (int)'F', ID_DISASM_FOCUSFUNCTIONSEARCH);
+	wxAcceleratorTable accel(1, accelEntries);
+	SetAcceleratorTable(accel);
+	Bind(wxEVT_MENU, &DisassemblyDialog::onFocusFunctionSearch, this, ID_DISASM_FOCUSFUNCTIONSEARCH);
 
 	CreateStatusBar(1);
 
@@ -318,6 +734,12 @@ void DisassemblyDialog::onSizeEvent(wxSizeEvent& event)
 	}
 
 	event.Skip();
+}
+
+void DisassemblyDialog::onFocusFunctionSearch(wxCommandEvent& evt)
+{
+	if (currentCpu != NULL)
+		currentCpu->focusFunctionSearch();
 }
 
 void DisassemblyDialog::onBreakRunClicked(wxCommandEvent& evt)
@@ -355,6 +777,23 @@ void DisassemblyDialog::onHelpClicked(wxCommandEvent& evt)
 {
 	DebuggerHelpDialog help(this);
 	help.ShowModal();
+}
+
+void DisassemblyDialog::onGameConfigClicked(wxCommandEvent& evt)
+{
+	if (currentCpu)
+	{
+		GameDebuggerConfigDialog dlg(this, currentCpu->getCpu());
+		if (dlg.ShowModal() == wxID_OK)
+		{
+			eeTab->clearSymbolMap();
+			iopTab->clearSymbolMap();
+			eeTab->reloadSymbolMap();
+			iopTab->reloadSymbolMap();
+			if (currentCpu->getDisassembly())
+				currentCpu->getDisassembly()->redraw();
+		}
+	}
 }
 
 void DisassemblyDialog::onPageChanging(wxCommandEvent& evt)
@@ -631,6 +1070,8 @@ void DisassemblyDialog::reset()
 
 void DisassemblyDialog::populate()
 {
+	GameDebuggerConfigManager::ApplyForCurrentGame(&r5900Debug);
+	GameDebuggerConfigManager::ApplyForCurrentGame(&r3000Debug);
 	eeTab->reloadSymbolMap();
 	iopTab->reloadSymbolMap();
 }

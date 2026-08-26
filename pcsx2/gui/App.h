@@ -113,6 +113,7 @@ enum MenuIdentifiers
 
 	MenuId_Sys_SuspendResume,  // suspends/resumes active emulation
 	MenuId_Sys_Shutdown,       // Closes virtual machine, wipes states
+	MenuId_Sys_Reboot,         // Resets the virtual machine and reboots emulation
 	MenuId_Sys_LoadStates,     // Opens load states submenu
 	MenuId_Sys_SaveStates,     // Opens save states submenu
 	MenuId_EnableBackupStates, // Checkbox to enable/disables savestates backup

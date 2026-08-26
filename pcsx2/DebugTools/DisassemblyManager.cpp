@@ -23,21 +23,75 @@
 #include "Memory.h"
 #include "Debug.h"
 #include "MIPSAnalyst.h"
+#include "GameDebuggerConfig.h"
 
 int DisassemblyManager::maxParamChars = 29;
+const std::vector<u32> CallGraphIndex::empty;
+
+void CallGraphIndex::Build(DebugInterface* cpu)
+{
+	callers.clear();
+
+	// Só escaneia funções do SymbolMap ativo no momento (GetAllSymbols já
+	// filtra por módulo ativo) -- overlays trocados/inativos não entram no
+	// índice, evitando falsos JAL "fantasma" de um overlay que não está
+	// residente. Recomputa do zero a cada Build(); não há atualização
+	// incremental porque uma escrita de memória pode ter mudado qualquer
+	// instrução JAL/JALR em qualquer função.
+	SymbolMap& map = cpu->GetSymbolMap();
+	std::vector<SymbolEntry> functions = map.GetAllSymbols(ST_FUNCTION);
+
+	for (const SymbolEntry& func : functions)
+	{
+		u32 start = func.address;
+		u32 end = start + (func.size != 0 ? func.size : 4);
+
+		for (u32 pos = start; pos < end; pos += 4)
+		{
+			if (!cpu->isValidAddress(pos))
+				continue;
+
+			MIPSAnalyst::MipsOpcodeInfo opInfo = MIPSAnalyst::GetOpcodeInfo(cpu, pos);
+
+			// JAL apenas -- JALR (isBranchToRegister) tem alvo dinâmico e não dá
+			// pra resolver estaticamente, então fica fora do índice.
+			if (opInfo.isLinkedBranch && !opInfo.isBranchToRegister)
+				callers[opInfo.branchTarget].push_back(pos);
+		}
+	}
+
+	built = true;
+}
+
+const std::vector<u32>& CallGraphIndex::GetCallers(DebugInterface* cpu, u32 funcAddr)
+{
+	if (!built)
+		Build(cpu);
+
+	auto it = callers.find(funcAddr);
+	if (it == callers.end())
+		return empty;
+	return it->second;
+}
 
 bool isInInterval(u32 start, u32 size, u32 value)
 {
 	return start <= value && value <= (start+size-1);
 }
 
-static u32 computeHash(u32 address, u32 size)
+// Antes lia direto de memRead32(), que assume o endereço mapeado e pode
+// crashar (deref de ponteiro nulo do vtlb) quando a função/dado pertence a
+// uma região de overlay cujo endereço não está atualmente residente/mapeado
+// (ex.: símbolos vindos de um .sym de overlay que a área ainda não carregou).
+// cpu->read32() já faz esse isValidAddress() internamente e devolve -1 para
+// endereço inválido, então o hash fica estável (0xFFFFFFFF) em vez de crashar.
+static u32 computeHash(DebugInterface* cpu, u32 address, u32 size)
 {
 	u32 end = address+size;
 	u32 hash = 0xBACD7814;
 	while (address < end)
 	{
-		hash += memRead32(address);
+		hash += cpu->read32(address);
 		address += 4;
 	}
 	return hash;
@@ -237,6 +291,24 @@ std::vector<BranchLine> DisassemblyManager::getBranchLines(u32 start, u32 size)
 
 void DisassemblyManager::getLine(u32 address, bool insertSymbols, DisassemblyLineInfo& dest)
 {
+	// Gatilho 2: detecta (throttlado internamente, ~5x/segundo no máximo) se algum
+	// arquivo .sym associado às regiões atualmente carregadas foi editado/reescrito
+	// no disco desde a última checagem, e recarrega silenciosamente se for o caso.
+	// Isso é o que efetivamente busca a mudança; getLine() só é o gatilho de
+	// "quando perguntar" (a cada linha desenhada), não o de "como detectar".
+	GameDebuggerConfigManager::CheckAndReloadIfNeeded(cpu);
+
+	// Gatilho 1: qualquer mudança estrutural no SymbolMap -- seja a recarga acima,
+	// seja uma edição feita direto pela UI do debugger (renomear função, adicionar
+	// label, redimensionar função) -- incrementa SymbolMap::generation. Comparar um
+	// u32 é essencialmente grátis, então isso roda em toda chamada sem throttle.
+	u32 currentSymGeneration = cpu->GetSymbolMap().GetGeneration();
+	if (currentSymGeneration != lastKnownSymGeneration)
+	{
+		clear();
+		lastKnownSymGeneration = currentSymGeneration;
+	}
+
 	auto it = findDisassemblyEntry(entries,address,false);
 	if (it == entries.end())
 	{
@@ -348,13 +420,13 @@ void DisassemblyManager::clear()
 DisassemblyFunction::DisassemblyFunction(DebugInterface* _cpu, u32 _address, u32 _size): address(_address), size(_size)
 {
 	cpu = _cpu;
-	hash = computeHash(address,size);
+	hash = computeHash(cpu,address,size);
 	load();
 }
 
 void DisassemblyFunction::recheck()
 {
-	u32 newHash = computeHash(address,size);
+	u32 newHash = computeHash(cpu,address,size);
 	if (hash != newHash)
 	{
 		hash = newHash;
@@ -816,13 +888,13 @@ bool DisassemblyMacro::disassemble(u32 address, DisassemblyLineInfo& dest, bool 
 DisassemblyData::DisassemblyData(DebugInterface* _cpu, u32 _address, u32 _size, DataType _type): address(_address), size(_size), type(_type)
 {
 	cpu = _cpu;
-	hash = computeHash(address,size);
+	hash = computeHash(cpu,address,size);
 	createLines();
 }
 
 void DisassemblyData::recheck()
 {
-	u32 newHash = computeHash(address,size);
+	u32 newHash = computeHash(cpu,address,size);
 	if (newHash != hash)
 	{
 		hash = newHash;
@@ -893,7 +965,10 @@ void DisassemblyData::createLines()
 		bool inString = false;
 		while (pos < end)
 		{
-			u8 b = memRead8(pos++);
+			// cpu->read8() checa isValidAddress() e devolve 0xFF para endereço
+			// não mapeado (ex.: overlay ainda não residente), em vez de crashar
+			// como memRead8() fazia ao ler direto de uma página não mapeada.
+			u8 b = (u8)cpu->read8(pos++);
 			if (b >= 0x20 && b <= 0x7F)
 			{
 				if (currentLine.size()+1 >= maxChars)
@@ -970,18 +1045,22 @@ void DisassemblyData::createLines()
 			switch (type)
 			{
 			case DATATYPE_BYTE:
-				value = memRead8(pos);
+				// cpu->read8/16/32 já checam isValidAddress() e retornam -1 (sem
+				// crash) para endereço não mapeado, ao contrário de memRead*()
+				// que assume a página presente e pode derrubar o emulador ao ler
+				// uma região de overlay ainda não carregada na RAM.
+				value = cpu->read8(pos);
 				sprintf(buffer,"0x%02X",value);
 				pos++;
 				break;
 			case DATATYPE_HALFWORD:
-				value = memRead16(pos);
+				value = cpu->read16(pos);
 				sprintf(buffer,"0x%04X",value);
 				pos += 2;
 				break;
 			case DATATYPE_WORD:
 				{
-					value = memRead32(pos);
+					value = cpu->read32(pos);
 					const std::string label = cpu->GetSymbolMap().GetLabelString(value);
 					if (!label.empty())
 						sprintf(buffer,"%s",label.c_str());

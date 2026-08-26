@@ -493,6 +493,16 @@ void MainEmuFrame::_DoBootCdvd()
 		}
 	}
 
+	// ELF override: só faz sentido passar g_Conf->CurrentELF adiante quando a
+	// fonte atual é NoDisc -- o cenário de "abrir um .elf solto" via
+	// Menu_OpenELF_Click() (HostFS/ELF, sem disco de verdade por trás). Pra
+	// Iso/Disc, CurrentELF pode estar com o caminho de um .elf de uma sessão
+	// HostFS anterior (ele nunca é limpo automaticamente ao trocar de fonte
+	// pelo menu "Seleção de ISO"/"Disc"), e se passarmos ele mesmo assim,
+	// SysExecute() prioriza o override e reinicia aquele ELF antigo em vez
+	// de bootar a ISO/disco que o usuário acabou de selecionar. Isso é
+	// diferente do bug original (ELF override faltando pro caso NoDisc) --
+	// aqui é o oposto: override sobrando pro caso Iso/Disc.
 	sApp.SysExecute(g_Conf->CdvdSource);
 }
 
@@ -858,6 +868,43 @@ void MainEmuFrame::Menu_SysShutdown_Click(wxCommandEvent& event)
 		Console.SetTitle("PCSX2 Program Log");
 		CoreThread.Reset();
 	}
+}
+
+void MainEmuFrame::Menu_SysReboot_Click(wxCommandEvent& event)
+{
+	if (!SysHasValidState())
+		return;
+
+#ifndef DISABLE_RECORDING
+	if (g_InputRecording.IsActive())
+	{
+		// Rebooting while an input recording is active just rewinds it back to frame 0,
+		// mirroring the behavior used when re-booting CDVD during a recording.
+		g_InputRecording.GoToFirstFrame(this);
+		return;
+	}
+#endif
+
+	wxDialogWithHelpers dialog(this, _("Confirm PS2 Reset"));
+	dialog += dialog.Heading(GetMsg_ConfirmSysReset());
+	bool confirmed = (pxIssueConfirmation(dialog, MsgButtons().Yes().Cancel(), L"Reboot.ConfirmReset") != wxID_CANCEL);
+
+	if (!confirmed)
+		return;
+
+	if (m_capturingVideo)
+		VideoCaptureToggle();
+
+	EnableMenuItem(MenuId_Sys_Reboot, false);
+	// Mesmo raciocínio de _DoBootCdvd() acima: só passa o override de ELF
+	// quando a fonte atual é NoDisc (cenário HostFS/ELF). Fora disso, um
+	// g_Conf->CurrentELF sobrando de uma sessão HostFS anterior faria o
+	// reboot reiniciar aquele ELF velho em vez da ISO/disco selecionado
+	// agora.
+	if (g_Conf->CdvdSource == CDVD_SourceType::NoDisc)
+		sApp.SysExecute(g_Conf->CdvdSource, g_Conf->CurrentELF);
+	else
+		sApp.SysExecute(g_Conf->CdvdSource);
 }
 
 void MainEmuFrame::Menu_Debug_Open_Click(wxCommandEvent& event)

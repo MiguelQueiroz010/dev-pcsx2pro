@@ -190,12 +190,39 @@ private:
 
 class DebugInterface;
 
+// Índice de cross-reference (quem chama cada função), usado pela árvore de
+// call-tree do menu de contexto do disassembler (botão direito > "Show call
+// tree"). Escaneia todas as funções ativas do SymbolMap uma vez, procurando
+// JAL/JALR diretos (isLinkedBranch && !isBranchToRegister -- JALR fica de fora
+// porque o alvo é dinâmico/registrador, não estático) e guarda, por endereço
+// de função alvo, a lista de endereços das instruções de call que apontam pra
+// ela. Resultado fica em cache até Invalidate() ser chamado; a UI é
+// responsável por chamar Invalidate() sempre que memória executável for
+// escrita (NOP, patch de instrução, restore) ou o SymbolMap mudar de geração,
+// senão a árvore mostra call sites que não existem mais (ou some novos).
+class CallGraphIndex
+{
+public:
+	// Retorna os endereços das instruções que fazem JAL para funcAddr.
+	// Constrói o índice inteiro na primeira chamada após Invalidate()/criação.
+	const std::vector<u32>& GetCallers(DebugInterface* cpu, u32 funcAddr);
+	void Invalidate() { built = false; callers.clear(); }
+	bool IsBuilt() const { return built; }
+
+private:
+	void Build(DebugInterface* cpu);
+
+	std::map<u32, std::vector<u32>> callers;
+	bool built = false;
+	static const std::vector<u32> empty;
+};
+
 class DisassemblyManager
 {
 public:
 	void clear();
 
-	void setCpu(DebugInterface* _cpu) { cpu = _cpu; };
+	void setCpu(DebugInterface* _cpu) { cpu = _cpu; lastKnownSymGeneration = 0; clear(); };
 	void setMaxParamChars(int num) { maxParamChars = num; clear(); };
 	void getLine(u32 address, bool insertSymbols, DisassemblyLineInfo& dest);
 	void analyze(u32 address, u32 size);
@@ -205,12 +232,31 @@ public:
 	u32 getNthPreviousAddress(u32 address, int n = 1);
 	u32 getNthNextAddress(u32 address, int n = 1);
 
+	// Ver CallGraphIndex acima. Chamar InvalidateCallGraph() em todo ponto que
+	// escreve na memória de instruções (NOP, patch, restore) antes de reabrir a
+	// árvore de call-tree.
+	CallGraphIndex& GetCallGraph() { return callGraph; }
+	void InvalidateCallGraph() { callGraph.Invalidate(); }
+
 	static int getMaxParamChars() { return maxParamChars; };
 private:
 	DisassemblyEntry* getEntry(u32 address);
 	std::map<u32,DisassemblyEntry*> entries;
 	DebugInterface* cpu = NULL;
 	static int maxParamChars;
+
+	// Gatilho 1 (render): SymbolMap::GetGeneration() é incrementado toda vez que a
+	// estrutura de símbolos muda (função renomeada/redimensionada, label
+	// adicionada/removida, módulo trocado, .sym recarregado -- ver UpdateActiveSymbols
+	// em SymbolMap.cpp). getLine() compara essa geração a cada linha renderizada; um
+	// simples "u32 !=" é barato o bastante pra rodar em toda chamada sem throttle.
+	// Quando diverge, o cache de 'entries' inteiro é invalidado (clear()) e
+	// reconstruído sob demanda via analyze(), então funções/labels/tipos de dado
+	// novos aparecem já no próximo repaint, não só quando o usuário rola até uma
+	// área ainda não visitada.
+	u32 lastKnownSymGeneration = 0;
+
+	CallGraphIndex callGraph;
 };
 
 bool isInInterval(u32 start, u32 size, u32 value);

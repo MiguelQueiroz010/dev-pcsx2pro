@@ -19,6 +19,7 @@
 #include "AppGameDatabase.h"
 
 #include <wx/stdpaths.h>
+#include <wx/stopwatch.h>
 #include "fmt/core.h"
 
 #include "common/StringUtil.h"
@@ -533,6 +534,48 @@ static void _ApplySettings(const Pcsx2Config& src, Pcsx2Config& fixup)
 	gsUpdateFrequency(fixup);
 }
 
+// --------------------------------------------------------------------------------
+//  Automatic cheats / widescreen-patch reload on external file edits
+// --------------------------------------------------------------------------------
+// Right now the only things that trigger a (re)load of the cheats/widescreen
+// .pnach files are booting a game and any settings change that routes through
+// ApplySettings(). Editing/regenerating a .pnach with an external tool while the
+// game is already running and nothing else changes never gets picked up.
+//
+// This adds a cheap, self-contained check (no IPC, no PINE, no file handle kept
+// open) using PatchSourceChangedOnDisk() -- a directory stat() comparing
+// mtime+size+file-count against what was recorded at the last successful load --
+// and if either the cheats or widescreen folder changed, redoes the exact same
+// reload pass _ApplySettings() already does on boot/settings-change. A full
+// re-run (not just the changed source) is required because IniPatch entries
+// don't record which file/source they came from -- GameDB patches, cheats, and
+// widescreen patches all share one flat Patch list, so partially patching it
+// back in isn't possible.
+static void CheckAndReloadCheatsIfChanged()
+{
+	// Nothing sensible to check before we've actually established a game/bios
+	// context at least once (curGameKey still holds its startup sentinel).
+	if (curGameKey.IsEmpty() || curGameKey == _UNKNOWN_GAME_KEY)
+		return;
+
+	const bool cheatsChanged = EmuConfig.EnableCheats && PatchSourceChangedOnDisk(GameInfo::gameCRC, EmuFolders::Cheats);
+	const bool wsChanged = EmuConfig.EnableWideScreenPatches && PatchSourceChangedOnDisk(GameInfo::gameCRC, EmuFolders::CheatsWS);
+
+	if (!cheatsChanged && !wsChanged)
+		return;
+
+	Console.WriteLn(Color_Green, "[Patch] %s%s%s file(s) changed on disk -- reloading.",
+		cheatsChanged ? "Cheat" : "",
+		(cheatsChanged && wsChanged) ? "/" : "",
+		wsChanged ? "Widescreen patch" : "");
+
+	// Same call LoadAllPatchesAndStuff() uses: reloads/re-titles without touching
+	// thread state (m_ExecMode, GS vsync, etc.) -- that part is only relevant when
+	// *actual* emulation settings changed, which isn't the case here.
+	Pcsx2Config dummy;
+	_ApplySettings(EmuConfig, dummy);
+}
+
 // FIXME: This function is not for general consumption. Its only consumer (and
 //        the only place it's declared at) is i5900-32.cpp .
 // It's here specifically to allow loading the patches synchronously (to the caller)
@@ -633,6 +676,23 @@ void AppCoreThread::OnCleanupInThread()
 void AppCoreThread::VsyncInThread()
 {
 	wxGetApp().LogicalVsync();
+
+	// Cheap, throttled poll (~1x/sec) for cheats/widescreen-patch files edited,
+	// rewritten, or recreated on disk while the game is running. Just a directory
+	// stat() via PatchSourceChangedOnDisk() -- no IPC/PINE, no watch handle kept
+	// open, nothing running outside this thread.
+	static wxStopWatch s_cheatsFileCheckTimer;
+	if (s_cheatsFileCheckTimer.Time() >= 1000)
+	{
+		CheckAndReloadCheatsIfChanged();
+		s_cheatsFileCheckTimer.Start();
+	}
+
+	// A checagem/reload de GameOverlay .sym não roda mais aqui via Vsync -- ela
+	// foi movida para DisassemblyManager::getLine() (DisassemblyManager.cpp),
+	// disparada pelo próprio render do disassembler, então só faz trabalho
+	// quando a janela de debug está de fato desenhando aquela região.
+
 	_parent::VsyncInThread();
 }
 

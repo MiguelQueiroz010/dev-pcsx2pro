@@ -186,6 +186,7 @@ protected:
 
 	void Menu_SuspendResume_Click(wxCommandEvent& event);
 	void Menu_SysShutdown_Click(wxCommandEvent& event);
+	void Menu_SysReboot_Click(wxCommandEvent& event);
 
 	void Menu_MultitapToggle_Click(wxCommandEvent& event);
 

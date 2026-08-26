@@ -24,6 +24,9 @@
 #include "gui/AppConfig.h"
 #include "System.h"
 #include "DisassemblyDialog.h"
+#include "DisassembleRegionDialog.h"
+#include "CallTreeDialog.h"
+#include "GraphViewDialog.h"
 
 #include <wx/mstream.h>
 #include <wx/clipbrd.h>
@@ -57,7 +60,10 @@ enum DisassemblyMenuIdentifiers
 	ID_DISASM_COPYINSTRUCTIONHEX,
 	ID_DISASM_COPYINSTRUCTIONDISASM,
 	ID_DISASM_DISASSEMBLETOFILE,
+	ID_DISASM_EXPORTREGION,
 	ID_DISASM_ASSEMBLE,
+	ID_DISASM_NOPINSTRUCTION,
+	ID_DISASM_RESTOREINSTRUCTION,
 	ID_DISASM_RUNTOHERE,
 	ID_DISASM_SETPCTOHERE,
 	ID_DISASM_TOGGLEBREAKPOINT,
@@ -67,7 +73,9 @@ enum DisassemblyMenuIdentifiers
 	ID_DISASM_KILLFUNCTION,
 	ID_DISASM_RENAMEFUNCTION,
 	ID_DISASM_REMOVEFUNCTION,
-	ID_DISASM_ADDFUNCTION
+	ID_DISASM_ADDFUNCTION,
+	ID_DISASM_SHOWCALLTREE,
+	ID_DISASM_SHOWGRAPHVIEW
 };
 
 class NonAutoSelectTextCtrl : public wxTextCtrl
@@ -161,9 +169,12 @@ CtrlDisassemblyView::CtrlDisassemblyView(wxWindow* parent, DebugInterface* _cpu)
 	menu.Append(ID_DISASM_COPYADDRESS, L"Copy Address");
 	menu.Append(ID_DISASM_COPYINSTRUCTIONHEX, L"Copy Instruction (Hex)");
 	menu.Append(ID_DISASM_COPYINSTRUCTIONDISASM, L"Copy Instruction (Disasm)");
-	menu.Append(ID_DISASM_DISASSEMBLETOFILE, L"Disassemble to File");
+	menu.Append(ID_DISASM_DISASSEMBLETOFILE, L"Disassemble Selection to File");
+	menu.Append(ID_DISASM_EXPORTREGION, L"Export Memory Region to Text (*.txt)...");
 	menu.AppendSeparator();
 	menu.Append(ID_DISASM_ASSEMBLE, L"Assemble Opcode(s)");
+	menu.Append(ID_DISASM_NOPINSTRUCTION, L"Replace with NOP / Transformar em NOP");
+	menu.Append(ID_DISASM_RESTOREINSTRUCTION, L"Restore Original Instruction(s) / Restaurar Instrução(ões) Original(is)");
 	menu.AppendSeparator();
 	menu.Append(ID_DISASM_RUNTOHERE, L"Run to Cursor");
 	menu.Append(ID_DISASM_SETPCTOHERE, L"Jump to Cursor");
@@ -176,6 +187,9 @@ CtrlDisassemblyView::CtrlDisassemblyView(wxWindow* parent, DebugInterface* _cpu)
 	menu.Append(ID_DISASM_ADDFUNCTION, L"Add Function Here");
 	menu.Append(ID_DISASM_RENAMEFUNCTION, L"Rename Function");
 	menu.Append(ID_DISASM_REMOVEFUNCTION, L"Remove Function");
+	menu.AppendSeparator();
+	menu.Append(ID_DISASM_SHOWCALLTREE, L"Show Call Tree");
+	menu.Append(ID_DISASM_SHOWGRAPHVIEW, L"Show Graph View");
 	menu.Bind(wxEVT_MENU, &CtrlDisassemblyView::onPopupClick, this);
 
 	SetScrollbar(wxVERTICAL, 100, 1, 201, true);
@@ -577,7 +591,11 @@ void CtrlDisassemblyView::render(wxDC& dc)
 		dc.SetFont(boldFont);
 		dc.DrawText(wxString(line.name.c_str(), wxConvUTF8), pixelPositions.opcodeStart, rowY1 + 2);
 
-		address += line.totalSize;
+		// Failsafe: prevent infinite loop if totalSize is 0
+		if (line.totalSize == 0)
+			address += 4;
+		else
+			address += line.totalSize;
 	}
 
 	std::vector<BranchLine> branchLines = manager.getBranchLines(windowStart, address - windowStart);
@@ -675,13 +693,17 @@ void CtrlDisassemblyView::assembleOpcode(u32 address, std::string defaultText)
 		{
 			for (u32 addr = selectRangeStart; addr < selectRangeEnd; addr += 0x4)
 			{
+				recordOriginalInstructionIfNeeded(addr);
 				cpu->write32(addr, encoded);
 			}
 		}
 		else
 		{
+			recordOriginalInstructionIfNeeded(address);
 			cpu->write32(address, encoded);
 		}
+
+		manager.InvalidateCallGraph();
 
 		redraw();
 	}
@@ -733,6 +755,15 @@ void CtrlDisassemblyView::onPopupClick(wxCommandEvent& evt)
 			break;
 		case ID_DISASM_DISASSEMBLETOFILE:
 			disassembleToFile();
+			break;
+		case ID_DISASM_EXPORTREGION:
+			disassembleRegionToFile();
+			break;
+		case ID_DISASM_NOPINSTRUCTION:
+			replaceWithNOP();
+			break;
+		case ID_DISASM_RESTOREINSTRUCTION:
+			restoreSelectedInstructions();
 			break;
 		case ID_DISASM_RENAMEFUNCTION:
 		{
@@ -826,6 +857,12 @@ void CtrlDisassemblyView::onPopupClick(wxCommandEvent& evt)
 		}
 		case ID_DISASM_ASSEMBLE:
 			assembleOpcode(curAddress, disassembleCurAddress());
+			break;
+		case ID_DISASM_SHOWCALLTREE:
+			showCallTree();
+			break;
+		case ID_DISASM_SHOWGRAPHVIEW:
+			showGraphView();
 			break;
 		default:
 			wxMessageBox(L"Unimplemented.", L"Unimplemented.", wxICON_INFORMATION);
@@ -976,32 +1013,39 @@ void CtrlDisassemblyView::scrollbarEvent(wxScrollWinEvent& evt)
 
 void CtrlDisassemblyView::toggleBreakpoint(bool toggleEnabled)
 {
-	bool enabled;
+	if (!cpu || !cpu->isAlive())
+	{
+		Console.Warning("[Debugger] toggleBreakpoint: CPU not alive, skipping.");
+		return;
+	}
+
+	bool enabled = false;
 	if (CBreakPoints::IsAddressBreakPoint(cpu->getCpuType(), curAddress, &enabled))
 	{
 		if (!enabled)
 		{
-			// enable disabled breakpoints
+			Console.WriteLn("[Debugger] toggleBreakpoint: Re-enabling breakpoint at %08X", curAddress);
 			CBreakPoints::ChangeBreakPoint(cpu->getCpuType(), curAddress, true);
 		}
 		else if (!toggleEnabled && CBreakPoints::GetBreakPointCondition(cpu->getCpuType(), curAddress) != NULL)
 		{
-			// don't just delete a breakpoint with a custom condition
+			Console.WriteLn("[Debugger] toggleBreakpoint: Removing conditional breakpoint at %08X", curAddress);
 			CBreakPoints::RemoveBreakPoint(cpu->getCpuType(), curAddress);
 		}
 		else if (toggleEnabled)
 		{
-			// disable breakpoint
+			Console.WriteLn("[Debugger] toggleBreakpoint: Disabling breakpoint at %08X", curAddress);
 			CBreakPoints::ChangeBreakPoint(cpu->getCpuType(), curAddress, false);
 		}
 		else
 		{
-			// otherwise just remove breakpoint
+			Console.WriteLn("[Debugger] toggleBreakpoint: Removing breakpoint at %08X", curAddress);
 			CBreakPoints::RemoveBreakPoint(cpu->getCpuType(), curAddress);
 		}
 	}
 	else
 	{
+		Console.WriteLn("[Debugger] toggleBreakpoint: Adding breakpoint at %08X", curAddress);
 		CBreakPoints::AddBreakPoint(cpu->getCpuType(), curAddress);
 	}
 }
@@ -1228,11 +1272,21 @@ std::string CtrlDisassemblyView::disassembleRange(u32 start, u32 size)
 {
 	std::string result;
 
+	// Cap size to a max of 2MB (500k instructions) to prevent main thread freezing
+	if (size > 0x00200000)
+		size = 0x00200000;
+
+	u64 endAddress = (u64)start + size;
+
 	// gather all branch targets without labels
 	std::set<u32> branchAddresses;
-	for (u32 i = 0; i < size; i += 4)
+	for (u64 i = 0; i < size; i += 4)
 	{
-		MIPSAnalyst::MipsOpcodeInfo info = MIPSAnalyst::GetOpcodeInfo(cpu, start + i);
+		u32 addr = (u32)(start + i);
+		if (!cpu->isValidAddress(addr))
+			continue;
+
+		MIPSAnalyst::MipsOpcodeInfo info = MIPSAnalyst::GetOpcodeInfo(cpu, addr);
 
 		if (info.isBranch && cpu->GetSymbolMap().GetLabelString(info.branchTarget).empty())
 		{
@@ -1243,41 +1297,64 @@ std::string CtrlDisassemblyView::disassembleRange(u32 start, u32 size)
 		}
 	}
 
-	u32 disAddress = start;
+	u64 disAddress = start;
 	bool previousLabel = true;
 	DisassemblyLineInfo line = DisassemblyLineInfo();
-	while (disAddress < start + size)
+	while (disAddress < endAddress)
 	{
-		char addressText[64], buffer[512];
+		u32 currentAddr = (u32)disAddress;
+		if (!cpu->isValidAddress(currentAddr))
+		{
+			disAddress += 4;
+			continue;
+		}
 
-		manager.getLine(disAddress, displaySymbols, line);
-		bool isLabel = getDisasmAddressText(disAddress, addressText, false, line.type == DISTYPE_OPCODE);
+		// Use a large enough buffer to avoid overflow from long symbol names
+		char addressText[256];
+		char buffer[1024];
+
+		manager.getLine(currentAddr, displaySymbols, line);
+		bool isLabel = getDisasmAddressText(currentAddr, addressText, false, line.type == DISTYPE_OPCODE);
 
 		if (isLabel)
 		{
 			if (!previousLabel)
 				result += "\r\n";
-			sprintf(buffer, "%s\r\n\r\n", addressText);
+			snprintf(buffer, sizeof(buffer), "%s\r\n", addressText);
 			result += buffer;
 		}
-		else if (branchAddresses.find(disAddress) != branchAddresses.end())
+		else if (branchAddresses.find(currentAddr) != branchAddresses.end())
 		{
 			if (!previousLabel)
 				result += "\r\n";
-			sprintf(buffer, "pos_%08X:\r\n\r\n", disAddress);
+			snprintf(buffer, sizeof(buffer), "pos_%08X:\r\n", currentAddr);
 			result += buffer;
 		}
 
-		if (line.info.isBranch && !line.info.isBranchToRegister && cpu->GetSymbolMap().GetLabelString(line.info.branchTarget).empty() && branchAddresses.find(line.info.branchTarget) != branchAddresses.end())
+		if (line.info.isBranch && !line.info.isBranchToRegister &&
+			cpu->GetSymbolMap().GetLabelString(line.info.branchTarget).empty() &&
+			branchAddresses.find(line.info.branchTarget) != branchAddresses.end())
 		{
-			sprintf(buffer, "pos_%08X", line.info.branchTarget);
-			line.params = line.params.substr(0, line.params.find("0x")) + buffer;
+			snprintf(buffer, sizeof(buffer), "pos_%08X", line.info.branchTarget);
+			// Safely find "0x" in params; if not found, append after the full params
+			size_t oxPos = line.params.find("0x");
+			if (oxPos != std::string::npos)
+				line.params = line.params.substr(0, oxPos) + buffer;
+			else
+				line.params = line.params + " " + buffer;
 		}
 
-		sprintf(buffer, "\t%s\t%s\r\n", line.name.c_str(), line.params.c_str());
+		// Truncate name/params individually to be safe before formatting
+		std::string safeName = line.name.substr(0, 32);
+		std::string safeParams = line.params.substr(0, 512);
+		snprintf(buffer, sizeof(buffer), "  %08X: %-10s %s\r\n", currentAddr, safeName.c_str(), safeParams.c_str());
 		result += buffer;
 		previousLabel = isLabel;
-		disAddress += line.totalSize;
+		
+		if (line.totalSize == 0)
+			disAddress += 4;
+		else
+			disAddress += line.totalSize;
 	}
 
 	return result;
@@ -1287,7 +1364,7 @@ std::string CtrlDisassemblyView::disassembleCurAddress()
 {
 	DisassemblyLineInfo line = DisassemblyLineInfo();
 	manager.getLine(curAddress, displaySymbols, line);
-	return line.name + (line.params.length() > 0 ? " " + line.params : "");
+	return line.name + " " + line.params;
 }
 
 void CtrlDisassemblyView::copyInstructions(u32 startAddr, u32 endAddr, bool withDisasm)
@@ -1339,8 +1416,291 @@ void CtrlDisassemblyView::disassembleToFile()
 	output.Write(wxString(disassembly.c_str(), wxConvUTF8));
 }
 
+void CtrlDisassemblyView::disassembleRegionToFile()
+{
+	DisassembleRegionDialog dlg(this, selectRangeStart, selectRangeEnd);
+	if (dlg.ShowModal() != wxID_OK)
+		return;
+
+	u32 startAddr = dlg.GetStartAddress();
+	u32 endAddr = dlg.GetEndAddress();
+	
+	// Snap start address to the beginning of the function if it's inside one
+	u32 funcStart = cpu->GetSymbolMap().GetFunctionStart(startAddr);
+	if (funcStart != SymbolMap::INVALID_ADDRESS && funcStart < startAddr)
+	{
+		startAddr = funcStart;
+	}
+	
+	u32 size = (endAddr > startAddr) ? (endAddr - startAddr) : 4;
+
+	wxString defaultFilename = wxString::Format(L"disasm_%08X_%08X.txt", startAddr, endAddr);
+	wxFileDialog saveDlg(this, L"Save Disassembly Text File", wxEmptyString, defaultFilename, L"Text Files (*.txt)|*.txt|All Files (*.*)|*.*", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+
+	if (saveDlg.ShowModal() == wxID_CANCEL)
+		return;
+
+	std::string disassembly = disassembleRange(startAddr, size);
+	wxFile output(saveDlg.GetPath(), wxFile::write);
+	if (output.IsOpened())
+	{
+		output.Write(wxString(disassembly.c_str(), wxConvUTF8));
+		wxMessageBox(L"Disassembly region exported successfully to text file (*.txt)!", L"Success", wxICON_INFORMATION, this);
+	}
+}
+
+void CtrlDisassemblyView::recordOriginalInstructionIfNeeded(u32 address)
+{
+	// Only the FIRST edit to a given address should record anything -- if it's
+	// already tracked, whatever's in memory right now is itself an edit (e.g. a
+	// NOP about to be overwritten by a fresh Assemble, or vice versa), and
+	// recording it would silently replace the true original with that edit,
+	// making it unrecoverable.
+	if (m_originalInstructions.find(address) != m_originalInstructions.end())
+		return;
+
+	m_originalInstructions[address] = cpu->read32(address);
+}
+
+void CtrlDisassemblyView::restoreSelectedInstructions()
+{
+	if (!cpu->isCpuPaused())
+	{
+		wxMessageBox(L"Cannot change code while the core is running. Please pause execution first.", L"Error.", wxICON_ERROR, this);
+		return;
+	}
+
+	u32 startAddr = selectRangeStart;
+	u32 endAddr = selectRangeEnd;
+	if (endAddr <= startAddr)
+	{
+		startAddr = curAddress;
+		endAddr = curAddress + 4;
+	}
+
+	int restoredCount = 0;
+	for (u32 addr = startAddr; addr < endAddr; addr += 4)
+	{
+		auto it = m_originalInstructions.find(addr);
+		if (it == m_originalInstructions.end())
+			continue; // nothing tracked here -- this address was never edited (or was already restored)
+
+		cpu->write32(addr, it->second);
+		m_originalInstructions.erase(it);
+		restoredCount++;
+	}
+
+	if (restoredCount == 0)
+	{
+		wxMessageBox(L"No edited instruction found in the current selection to restore.", L"Nothing to restore.", wxICON_INFORMATION, this);
+		return;
+	}
+
+	manager.InvalidateCallGraph();
+
+	SysClearExecutionCache();
+	redraw();
+}
+
+void CtrlDisassemblyView::replaceWithNOP()
+{
+	if (!cpu->isCpuPaused())
+	{
+		wxMessageBox(L"Cannot change code while the core is running. Please pause execution first.", L"Error.", wxICON_ERROR, this);
+		return;
+	}
+
+	u32 startAddr = selectRangeStart;
+	u32 endAddr = selectRangeEnd;
+	if (endAddr <= startAddr)
+	{
+		startAddr = curAddress;
+		endAddr = curAddress + 4;
+	}
+
+	SysClearExecutionCache();
+
+	for (u32 addr = startAddr; addr < endAddr; addr += 4)
+	{
+		recordOriginalInstructionIfNeeded(addr);
+		cpu->write32(addr, 0x00000000);
+	}
+
+	// Endereços que viravam JAL podem ter deixado de ser calls; endereços que
+	// não eram podem agora precisar não ser mais tratados como alvo -- mais
+	// simples invalidar o índice inteiro do que tentar remendar entradas.
+	manager.InvalidateCallGraph();
+
+	redraw();
+}
+
+void CtrlDisassemblyView::showCallTree()
+{
+	u32 funcStart = cpu->GetSymbolMap().GetFunctionStart(curAddress);
+	if (funcStart == 0xFFFFFFFF)
+	{
+		wxMessageBox(L"No function symbol at this address.", L"Error.", wxICON_ERROR, this);
+		return;
+	}
+
+	// Instância única: se já tem uma Call Tree aberta, reconstrói ela pra
+	// função nova em vez de empilhar janela nova por cima -- evita a
+	// bagunça de várias árvores abertas sem querer. Sem o
+	// rebuildForFunction() aqui, reaproveitar a instância só trazia a
+	// janela antiga pra frente com a árvore antiga, sem atualizar pra
+	// função nova (mesmo bug do Graph View, ver showGraphView() abaixo).
+	// activeCallTree_ é zerado via EVT_DESTROY quando a janela é fechada
+	// (ver ctor abaixo).
+	if (activeCallTree_ != nullptr)
+	{
+		activeCallTree_->rebuildForFunction(funcStart);
+		activeCallTree_->Raise();
+		activeCallTree_->SetFocus();
+		return;
+	}
+
+	// Não-modal (wxFrame que se autodestrói ao fechar -- ver CallTreeDialog.h):
+	// não pode travar o resto do debugger.
+	activeCallTree_ = new CallTreeDialog(this, cpu, &manager, funcStart);
+	activeCallTree_->Bind(wxEVT_DESTROY, &CtrlDisassemblyView::onCallTreeDestroy, this);
+	activeCallTree_->Show();
+}
+
+void CtrlDisassemblyView::showGraphView()
+{
+	u32 funcStart = cpu->GetSymbolMap().GetFunctionStart(curAddress);
+	if (funcStart == 0xFFFFFFFF)
+	{
+		wxMessageBox(L"No function symbol at this address.", L"Error.", wxICON_ERROR, this);
+		return;
+	}
+
+	// Mesma lógica de instância única do Call Tree acima: reconstrói a
+	// janela existente pra função nova em vez de só trazer ela pra frente
+	// com o grafo antigo.
+	if (activeGraphView_ != nullptr)
+	{
+		activeGraphView_->rebuildForFunction(funcStart);
+		activeGraphView_->Raise();
+		activeGraphView_->SetFocus();
+		return;
+	}
+
+	activeGraphView_ = new GraphViewDialog(this, cpu, &manager, funcStart);
+	activeGraphView_->Bind(wxEVT_DESTROY, &CtrlDisassemblyView::onGraphViewDestroy, this);
+	activeGraphView_->Show();
+}
+
+bool CtrlDisassemblyView::PatchCallTarget(u32 callSiteAddr, u32 newTarget)
+{
+	if (!cpu->isCpuPaused())
+	{
+		wxMessageBox(L"Cannot change code while the core is running. Please pause execution first.", L"Error.", wxICON_ERROR, this);
+		return false;
+	}
+
+	u32 instr = cpu->read32(callSiteAddr);
+	// JAL = opcode 000011 nos 6 bits mais altos. JALR não é tratado aqui: o
+	// alvo dele é um registrador, não um campo imediato de 26 bits, então não
+	// dá pra "redirecionar" reescrevendo a instrução da mesma forma.
+	if ((instr >> 26) != 0x03)
+	{
+		wxMessageBox(L"Call site instruction is not a JAL; cannot redirect.", L"Error.", wxICON_ERROR, this);
+		return false;
+	}
+
+	if ((newTarget & 0x3) != 0 || ((newTarget ^ (callSiteAddr + 4)) & 0xF0000000) != 0)
+	{
+		wxMessageBox(L"Target address is not reachable by a direct JAL from this call site (must share the same 256MB region and be word-aligned).", L"Error.", wxICON_ERROR, this);
+		return false;
+	}
+
+	u32 encoded = 0x0C000000 | ((newTarget >> 2) & 0x03FFFFFF);
+
+	recordOriginalInstructionIfNeeded(callSiteAddr);
+	cpu->write32(callSiteAddr, encoded);
+	SysClearExecutionCache();
+	manager.InvalidateCallGraph();
+	redraw();
+	return true;
+}
+
+bool CtrlDisassemblyView::PatchBranchTarget(u32 branchAddr, u32 newTarget)
+{
+	if (!cpu->isCpuPaused())
+	{
+		wxMessageBox(L"Cannot change code while the core is running. Please pause execution first.", L"Error.", wxICON_ERROR, this);
+		return false;
+	}
+
+	u32 instr = cpu->read32(branchAddr);
+	u32 opcode = instr >> 26;
+
+	if (opcode == 0x02) // J -- absoluto de 26 bits, mesmo esquema do JAL em PatchCallTarget
+	{
+		if ((newTarget & 0x3) != 0 || ((newTarget ^ (branchAddr + 4)) & 0xF0000000) != 0)
+		{
+			wxMessageBox(L"Target address is not reachable by a direct J from this branch (must share the same 256MB region and be word-aligned).", L"Error.", wxICON_ERROR, this);
+			return false;
+		}
+
+		u32 encoded = (instr & 0xFC000000) | ((newTarget >> 2) & 0x03FFFFFF);
+		recordOriginalInstructionIfNeeded(branchAddr);
+		cpu->write32(branchAddr, encoded);
+	}
+	else
+	{
+		// Branch condicional (BEQ/BNE/BLEZ/BGTZ, família REGIMM (BLTZ/BGEZ...),
+		// COP1 BC1T/BC1F, e as variantes "likely" BEQL/BNEL/BLEZL/BGTZL do EE):
+		// 16 bits relativos, em unidades de instrução (>>2), contados a partir
+		// de branchAddr+4 (delay slot) -- a mesma convenção que o
+		// desmontador/MIPSAnalyst usa pra calcular branchTarget, só que na
+		// direção contrária (endereço -> campo imediato em vez de campo
+		// imediato -> endereço).
+		bool isConditionalFamily = (opcode == 0x01 || opcode == 0x04 || opcode == 0x05 ||
+			opcode == 0x06 || opcode == 0x07 || opcode == 0x11 ||
+			opcode == 0x14 || opcode == 0x15 || opcode == 0x16 || opcode == 0x17);
+		if (!isConditionalFamily)
+		{
+			wxMessageBox(L"This instruction is not a recognized branch/jump; cannot redirect.", L"Error.", wxICON_ERROR, this);
+			return false;
+		}
+
+		s32 delta = (s32)newTarget - (s32)(branchAddr + 4);
+		if ((delta & 0x3) != 0)
+		{
+			wxMessageBox(L"Target address is not word-aligned.", L"Error.", wxICON_ERROR, this);
+			return false;
+		}
+
+		s32 imm = delta >> 2;
+		if (imm < -32768 || imm > 32767)
+		{
+			wxMessageBox(L"Target address is out of range for a conditional branch (\u00b1128KB from the delay slot).", L"Error.", wxICON_ERROR, this);
+			return false;
+		}
+
+		u32 encoded = (instr & 0xFFFF0000) | ((u32)imm & 0xFFFF);
+		recordOriginalInstructionIfNeeded(branchAddr);
+		cpu->write32(branchAddr, encoded);
+	}
+
+	SysClearExecutionCache();
+	manager.InvalidateCallGraph();
+	redraw();
+	return true;
+}
+
 void CtrlDisassemblyView::editBreakpoint()
 {
+	if (!cpu || !cpu->isAlive())
+	{
+		Console.Warning("[Debugger] editBreakpoint: CPU not alive, skipping.");
+		return;
+	}
+
+	Console.WriteLn("[Debugger] editBreakpoint: Opening breakpoint dialog for address %08X", curAddress);
+
 	BreakpointWindow win(this, cpu);
 
 	bool exists = false;
@@ -1351,6 +1711,7 @@ void CtrlDisassemblyView::editBreakpoint()
 		{
 			if (breakpoints[i].addr == curAddress)
 			{
+				Console.WriteLn("[Debugger] editBreakpoint: Found existing breakpoint at %08X", curAddress);
 				win.loadFromBreakpoint(breakpoints[i]);
 				exists = true;
 				break;
@@ -1359,13 +1720,20 @@ void CtrlDisassemblyView::editBreakpoint()
 	}
 
 	if (!exists)
+	{
+		Console.WriteLn("[Debugger] editBreakpoint: Initializing new breakpoint at %08X", curAddress);
 		win.initBreakpoint(curAddress);
+	}
 
 	if (win.ShowModal() == wxID_OK)
 	{
 		if (exists)
+		{
+			Console.WriteLn("[Debugger] editBreakpoint: Replacing existing breakpoint at %08X", curAddress);
 			CBreakPoints::RemoveBreakPoint(cpu->getCpuType(), curAddress);
+		}
 		win.addBreakpoint();
+		Console.WriteLn("[Debugger] editBreakpoint: Breakpoint added at %08X, posting update event.", curAddress);
 		postEvent(debEVT_UPDATE, 0);
 	}
 }

@@ -22,6 +22,7 @@
 #include "ft2build.h"
 #include FT_FREETYPE_H
 #include <map>
+#include <chrono>
 
 class GSOsdManager
 {

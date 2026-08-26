@@ -923,10 +923,25 @@
     <ClCompile Include="DebugTools\DisassemblyManager.cpp">
       <Filter>System\Ps2\Debug</Filter>
     </ClCompile>
+    <ClCompile Include="DebugTools\GameDebuggerConfig.cpp">
+      <Filter>System\Ps2\Debug</Filter>
+    </ClCompile>
     <ClCompile Include="gui\Debugger\CtrlDisassemblyView.cpp">
       <Filter>AppHost\Debugger</Filter>
     </ClCompile>
+    <ClCompile Include="gui\Debugger\CallTreeDialog.cpp">
+      <Filter>AppHost\Debugger</Filter>
+    </ClCompile>
+    <ClCompile Include="gui\Debugger\GraphViewDialog.cpp">
+      <Filter>AppHost\Debugger</Filter>
+    </ClCompile>
     <ClCompile Include="gui\Debugger\DisassemblyDialog.cpp">
+      <Filter>AppHost\Debugger</Filter>
+    </ClCompile>
+    <ClCompile Include="gui\Debugger\DisassembleRegionDialog.cpp">
+      <Filter>AppHost\Debugger</Filter>
+    </ClCompile>
+    <ClCompile Include="gui\Debugger\GameDebuggerConfigDialog.cpp">
       <Filter>AppHost\Debugger</Filter>
     </ClCompile>
     <ClCompile Include="DebugTools\MIPSAnalyst.cpp">
@@ -2029,6 +2044,12 @@
       <Filter>System\Ps2\Debug</Filter>
     </ClInclude>
     <ClInclude Include="gui\Debugger\CtrlDisassemblyView.h">
+      <Filter>AppHost\Debugger</Filter>
+    </ClInclude>
+    <ClInclude Include="gui\Debugger\CallTreeDialog.h">
+      <Filter>AppHost\Debugger</Filter>
+    </ClInclude>
+    <ClInclude Include="gui\Debugger\GraphViewDialog.h">
       <Filter>AppHost\Debugger</Filter>
     </ClInclude>
     <ClInclude Include="gui\Debugger\DisassemblyDialog.h">

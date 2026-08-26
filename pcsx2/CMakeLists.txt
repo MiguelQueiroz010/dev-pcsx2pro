@@ -970,6 +970,8 @@ set(pcsx2GuiSources
 	gui/Debugger/CtrlMemSearch.cpp
 	gui/Debugger/DebuggerLists.cpp
 	gui/Debugger/DisassemblyDialog.cpp
+	gui/Debugger/DisassembleRegionDialog.cpp
+	gui/Debugger/GameDebuggerConfigDialog.cpp
 	gui/Debugger/DebugEvents.cpp
 	gui/DriveList.cpp
 	gui/ExecutorThread.cpp

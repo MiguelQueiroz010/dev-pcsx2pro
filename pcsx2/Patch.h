@@ -110,6 +110,17 @@ extern int  LoadPatchesFromGamesDB(const wxString& crc, const GameDatabaseSchema
 extern int  LoadPatchesFromDir(wxString name, const wxDirName& folderName, const wxString& friendlyName);
 extern int  LoadPatchesFromZip(wxString gameCRC, const wxString& cheatsArchiveFilename);
 
+// Cheap, self-contained check for whether the <crc>*.pnach file(s) belonging to a
+// given patch source folder (e.g. EmuFolders::Cheats or EmuFolders::CheatsWS) have
+// been added, removed, or edited on disk since the last time this same crc+folder
+// pair was checked (or, on the very first check, since app startup). Compares a
+// signature of file count + total size + latest modification time -- no file
+// contents are read, so this is safe to call frequently (e.g. once per second from
+// VsyncInThread()). Returns false the first time a given crc+folder pair is seen,
+// since there's nothing yet to diff against (that first call also establishes the
+// baseline signature for future comparisons).
+extern bool PatchSourceChangedOnDisk(const wxString& crc, const wxDirName& folderName);
+
 // Patches the emulation memory by applying all the loaded patches with a specific place value.
 // Note: unless you know better, there's no need to check whether or not different patch sources
 // are enabled (e.g. ws patches, auto game fixes, etc) before calling ApplyLoadedPatches,

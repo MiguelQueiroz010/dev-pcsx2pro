@@ -27,7 +27,15 @@ enum SymbolType {
 	ST_NONE     = 0,
 	ST_FUNCTION = 1,
 	ST_DATA     = 2,
-	ST_ALL      = 3,
+	// Labels "soltos" (endereços nomeados via AddLabel que não são o início de
+	// uma função nem um bloco de dados -- ex: destino de um branch nomeado
+	// manualmente num .sym). Note que AddFunction() também grava um AddLabel()
+	// espelhado no mesmo endereço (ver AddFunction), então GetAllSymbols(ST_LABEL)
+	// devolve tanto os labels soltos quanto esses espelhos; quem consome o
+	// resultado e quer só os soltos precisa filtrar comparando com
+	// GetFunctionStart(label.address) == label.address.
+	ST_LABEL    = 4,
+	ST_ALL      = 7,
 };
 
 struct SymbolInfo {
@@ -40,6 +48,10 @@ struct SymbolEntry {
 	std::string name;
 	u32 address;
 	u32 size;
+	// Índice do módulo dono do símbolo, copiado direto de FunctionEntry::module /
+	// DataEntry::module (não re-derivado por endereço, que é impreciso perto dos
+	// limites de módulo). 0 = ELF base.
+	int moduleIndex = 0;
 };
 
 struct LoadedModuleInfo {
@@ -59,7 +71,7 @@ public:
 	void Clear();
 	void SortSymbols();
 
-	bool LoadNocashSym(const char *ilename);
+	bool LoadNocashSym(const char *filename, u32 baseOffset = 0);
 
 	SymbolType GetSymbolType(u32 address) const;
 	bool GetSymbolInfo(SymbolInfo *info, u32 address, SymbolType symmask = ST_FUNCTION) const;
@@ -68,12 +80,40 @@ public:
 	std::vector<SymbolEntry> GetAllSymbols(SymbolType symmask);
 
 	void AddModule(const char *name, u32 address, u32 size);
+	// Deactivates whatever module currently occupies the (address+size) end-address
+	// slot, regardless of which module that is. Safe only when it's guaranteed no
+	// other module shares that same end address (e.g. a single, non-overlaid module).
 	void UnloadModule(u32 address, u32 size);
+	// Identity-safe variant: only deactivates the slot if the module CURRENTLY active
+	// there is actually named `name`. Use this whenever multiple modules can share the
+	// same address range (e.g. game overlays swapped in/out at the same memory
+	// location) -- otherwise deactivating an inactive region can accidentally erase a
+	// different, legitimately active region that happens to end at the same address.
+	void UnloadModule(const char *name, u32 address, u32 size);
 	u32 GetModuleRelativeAddr(u32 address, int moduleIndex = -1) const;
 	u32 GetModuleAbsoluteAddr(u32 relative, int moduleIndex) const;
 	int GetModuleIndex(u32 address) const;
+	// Looks up a module's index by name regardless of whether it's currently active.
+	// Returns -1 if no module with that name has ever been added. Used to find the
+	// module to purge via ClearModuleSymbols() before reparsing an updated SYM file.
+	int GetModuleIndexByName(const char *name) const;
 	bool IsModuleActive(int moduleIndex) const;
 	std::vector<LoadedModuleInfo> getAllModules() const;
+	// Nome de exibição do módulo dono de um símbolo, para agrupamento na UI
+	// (Functions: Group by Region). moduleIndex 0 (ou qualquer índice sem módulo
+	// registrado) volta "ELF"; caso contrário o nome do módulo/overlay cadastrado
+	// via AddModule, mesmo se esse módulo estiver inativo no momento.
+	std::string GetModuleName(int moduleIndex) const;
+
+	// Removes every function/label/data entry belonging to moduleIndex (from both the
+	// backing functions/labels/data maps and, after an internal UpdateActiveSymbols(),
+	// the active* views). Needed before reloading a module's SYM file: AddFunction/
+	// AddLabel/AddData intentionally never overwrite an existing entry, so simply
+	// re-running LoadNocashSym on a changed or swapped-out overlay would leave stale
+	// symbols (renamed, resized, or removed in the new file) sitting there forever.
+	// Refuses to act on moduleIndex <= 0, since that range is used for global/
+	// non-module symbols shared by everything.
+	void ClearModuleSymbols(int moduleIndex);
 
 	void AddFunction(const char* name, u32 address, u32 size, int moduleIndex = -1);
 	u32 GetFunctionStart(u32 address) const;
@@ -96,6 +136,23 @@ public:
 
 	void UpdateActiveSymbols();
 	bool IsEmpty() const { return activeFunctions.empty() && activeLabels.empty() && activeData.empty(); };
+
+	// Bumped by UpdateActiveSymbols() every time it runs -- which is the single
+	// choke point every structural change (AddModule, UnloadModule, ClearModuleSymbols,
+	// SetFunctionSize, RemoveFunction, a freshly reloaded SYM file) already funnels
+	// through -- and also by Clear() directly, since that one resets everything
+	// without going through UpdateActiveSymbols(). Cheap (u32 compare) way for
+	// callers like DisassemblyManager to detect "something in the symbol map
+	// changed since I last looked" without re-parsing or re-hashing anything
+	// themselves.
+	u32 GetGeneration() const { return generation; }
+
+	// When true, every SymbolMap mutation writes a detailed step-by-step trace via
+	// Console.WriteLn/Console.Warning. Those calls already flow into PCSX2's on-disk
+	// log (when console logging is enabled in the app), so toggling this on is enough
+	// to get a saved, detailed trace of everything SymbolMap does. Off by default to
+	// avoid spamming the console/log during normal play.
+	static bool VerboseLogging;
 private:
 	void AssignFunctionIndices();
 	const char *GetLabelName(u32 address) const;
@@ -146,6 +203,9 @@ private:
 	std::vector<ModuleEntry> modules;
 
 	mutable std::recursive_mutex m_lock;
+
+	// See GetGeneration(). Incremented at the top of UpdateActiveSymbols().
+	u32 generation = 0;
 };
 
 extern SymbolMap R5900SymbolMap;

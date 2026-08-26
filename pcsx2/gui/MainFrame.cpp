@@ -270,6 +270,7 @@ void MainEmuFrame::ConnectMenus()
 #endif
 	Bind(wxEVT_MENU, &MainEmuFrame::Menu_EnableHostFs_Click, this, MenuId_EnableHostFs);
 	Bind(wxEVT_MENU, &MainEmuFrame::Menu_SysShutdown_Click, this, MenuId_Sys_Shutdown);
+	Bind(wxEVT_MENU, &MainEmuFrame::Menu_SysReboot_Click, this, MenuId_Sys_Reboot);
 	Bind(wxEVT_MENU, &MainEmuFrame::Menu_Exit_Click, this, MenuId_Exit);
 
 	// CDVD
@@ -378,6 +379,10 @@ void MainEmuFrame::CreatePcsx2Menu()
 	m_menuSys.Append(MenuId_Sys_Shutdown, _("Shut&down"),
 		_("Wipes all internal VM states."));
 	m_menuSys.FindItem(MenuId_Sys_Shutdown)->Enable(false);
+
+	m_menuSys.Append(MenuId_Sys_Reboot, _("&Reboot"),
+		_("Resets the virtual machine and restarts emulation from the beginning."));
+	m_menuSys.FindItem(MenuId_Sys_Reboot)->Enable(false);
 
 	m_menuSys.Append(MenuId_Boot_ELF, _("&Run ELF..."),
 		_("For running raw PS2 binaries directly."));
@@ -780,6 +785,9 @@ void MainEmuFrame::ApplySuspendStatus()
 		// Re-init keybinding after changing the label.
 		AppendShortcutToMenuOption(*susres, wxGetApp().GlobalAccels->findKeycodeWithCommandId("Sys_SuspendResume").toTitleizedString());
 	}
+
+	if (wxMenuItem* reboot = GetMenuBar()->FindItem(MenuId_Sys_Reboot))
+		reboot->Enable(SysHasValidState());
 }
 
 void MainEmuFrame::ApplyCDVDStatus()
