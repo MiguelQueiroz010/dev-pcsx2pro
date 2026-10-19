@@ -493,6 +493,38 @@ void CtrlDisassemblyView::drawArguments(wxDC& dc, const DisassemblyLineInfo& lin
 	}
 }
 
+// Lê uma string ASCII terminada em NUL (mín. 3 e máx. 40 caracteres imprimíveis)
+// em 'addr'. Só usa cpu->read8 (que já valida o endereço), então é seguro pra
+// qualquer valor de 'li' -- devolve false se não parecer uma string de verdade.
+static bool readStringAt(DebugInterface* cpu, u32 addr, std::string& out)
+{
+	const u32 kMaxChars = 40;
+	out.clear();
+
+	if (addr < 0x1000 || !cpu->isValidAddress(addr))
+		return false;
+
+	for (u32 i = 0; i < kMaxChars + 1; i++)
+	{
+		if (!cpu->isValidAddress(addr + i))
+			return false;
+
+		u32 c = cpu->read8(addr + i) & 0xFF;
+		if (c == 0)
+			return out.size() >= 3;
+		if (c < 0x20 || c >= 0x7F)
+			return false;
+
+		if (i == kMaxChars)
+		{
+			out += "~"; // string maior que o limite -- indica truncamento
+			return out.size() >= 3;
+		}
+		out += (char)c;
+	}
+	return false;
+}
+
 void CtrlDisassemblyView::render(wxDC& dc)
 {
 	// init stuff
@@ -584,6 +616,25 @@ void CtrlDisassemblyView::render(wxDC& dc)
 		dc.SetFont(font);
 		dc.DrawText(wxString(addressText, wxConvUTF8), pixelPositions.addressStart, rowY1 + 2);
 		drawArguments(dc, line, pixelPositions.argumentsStart, rowY1 + 2, textColor, currentArguments);
+
+		// Detector de String Lida: "li reg,<endereço>" que aponta pra uma string ASCII
+		// legível na memória ganha a string como comentário com fundo amarelo.
+		if (line.type == DISTYPE_MACRO && line.info.hasRelevantAddress && !line.info.isDataAccess)
+		{
+			std::string str;
+			if (readStringAt(cpu, line.info.releventAddress, str))
+			{
+				wxString comment = wxString::Format(L"; \"%s\"", wxString(str.c_str(), wxConvUTF8));
+				int cx = pixelPositions.argumentsStart + (int)(line.params.size() + 2) * charWidth;
+				dc.SetBrush(wxBrush(wxColour(255, 255, 0)));
+				dc.SetPen(wxPen(wxColour(255, 255, 0)));
+				dc.DrawRectangle(cx - 2, rowY1, (int)comment.length() * charWidth + 4, rowHeight);
+				dc.SetTextForeground(wxColour(0, 0, 0));
+				dc.SetFont(font);
+				dc.DrawText(comment, cx, rowY1 + 2);
+				dc.SetTextForeground(textColor);
+			}
+		}
 
 		if (isInInterval(address, line.totalSize, cpu->getPC()))
 			dc.DrawText(L"\u25A0", pixelPositions.opcodeStart - (charWidth + 1), rowY1);
