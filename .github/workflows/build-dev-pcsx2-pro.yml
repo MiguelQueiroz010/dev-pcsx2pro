@@ -1,0 +1,108 @@
+name: 🛠️ DEV PCSX2 PRO - Windows x86 Build
+
+# Compila automaticamente o fork (x86 / 32 bits, como no README) a cada push,
+# pull request ou manualmente (aba Actions -> "Run workflow").
+# Ao criar uma tag "v*" (ex.: v1.0.0), também publica um GitHub Release com o .7z.
+on:
+  push:
+    branches:
+      - master
+      - devup
+    tags:
+      - 'v*'
+    paths-ignore:
+      - '**/*.md'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: 'Configuração do Visual Studio'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Release AVX2
+          - Devel
+          - Debug
+
+permissions:
+  contents: write # necessário só para publicar o Release em tags
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Win32 | ${{ inputs.configuration || 'Release' }}
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    env:
+      CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+      POWERSHELL_TELEMETRY_OPTOUT: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build (msbuild)
+        shell: cmd
+        run: >
+          msbuild "PCSX2_suite.sln" /m /v:m /nologo
+          /p:Configuration="%CONFIGURATION%" /p:Platform=Win32
+
+      - name: Prepare artifact name
+        id: meta
+        shell: bash
+        run: |
+          SHA=$(git rev-parse --short "$GITHUB_SHA")
+          NAME="DEV-PCSX2-PRO-x86-${CONFIGURATION// /-}-${SHA}"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Package (7z)
+        shell: bash
+        run: |
+          mkdir -p ci-artifacts
+          7z a "ci-artifacts/${{ steps.meta.outputs.name }}.7z" ./bin/* \
+            '-xr!*.bsc' '-xr!*.exp' '-xr!*.ilk' '-xr!*.iobj' '-xr!*.ipdb' '-xr!*.pdb' '-xr!*.lib'
+          7z a "ci-artifacts/${{ steps.meta.outputs.name }}-symbols.7z" ./bin/*.pdb || true
+          ls -la ci-artifacts
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: |
+            bin
+            !bin/**/*.bsc
+            !bin/**/*.exp
+            !bin/**/*.ilk
+            !bin/**/*.iobj
+            !bin/**/*.ipdb
+            !bin/**/*.pdb
+            !bin/**/*.lib
+          if-no-files-found: error
+
+      - name: Upload symbols (.pdb)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}-symbols
+          path: bin/**/*.pdb
+          if-no-files-found: ignore
+
+      - name: Publish Release (tags v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ci-artifacts/*.7z
+          generate_release_notes: true
