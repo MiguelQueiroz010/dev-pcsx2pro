@@ -117,6 +117,8 @@ public:
 
 	void AddFunction(const char* name, u32 address, u32 size, int moduleIndex = -1);
 	u32 GetFunctionStart(u32 address) const;
+	// O(log n), sem copiar nada: true se o módulo já tem ao menos uma função cadastrada.
+	bool ModuleHasFunctions(int moduleIndex) const;
 	int GetFunctionNum(u32 address) const;
 	u32 GetFunctionSize(u32 startAddress) const;
 	bool SetFunctionSize(u32 startAddress, u32 newSize);

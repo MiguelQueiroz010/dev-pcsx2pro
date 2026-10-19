@@ -22,8 +22,6 @@
 #include "R5900.h"
 #include "R5900OpcodeTables.h"
 
-static std::vector<MIPSAnalyst::AnalyzedFunction> functions;
-
 #define MIPS_MAKE_J(addr)   (0x08000000 | ((addr)>>2))
 #define MIPS_MAKE_JAL(addr) (0x0C000000 | ((addr)>>2))
 #define MIPS_MAKE_JR_RA()   (0x03e00008)
@@ -204,10 +202,17 @@ namespace MIPSAnalyst
 		bool end = false;
 		bool isStraightLeaf = true;
 
-		functions.clear();
+		// Local (antes era um vetor estático global sem lock: a thread do emulador
+		// (GameStartingInThread) e a UI (fallback de overlays) chamavam isto ao mesmo
+		// tempo e corrompiam o vetor).
+		std::vector<AnalyzedFunction> functions;
 
 		u32 addr;
 		for (addr = startAddr; addr <= endAddr; addr += 4) {
+			// endAddr perto de 0xFFFFFFFF faria 'addr' dar a volta e o loop nunca terminar.
+			if (addr + 4 < addr)
+				break;
+
 			// Use pre-existing symbol map info if available. May be more reliable.
 			SymbolInfo syminfo;
 			if (map.GetSymbolInfo(&syminfo, addr, ST_FUNCTION)) {

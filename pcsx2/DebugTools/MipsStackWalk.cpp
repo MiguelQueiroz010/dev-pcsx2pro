@@ -39,7 +39,7 @@ namespace MipsStackWalk {
 	// In the worst case, we scan this far above the pc for an entry.
 	const int MAX_FUNC_SIZE = 32768 * 4;
 	// After this we assume we're stuck.
-	const size_t MAX_DEPTH = 1024;
+	const size_t MAX_DEPTH = 256;
 
 	static u32 GuessEntry(DebugInterface* cpu, u32 pc) {
 		SymbolInfo info;
@@ -98,7 +98,7 @@ namespace MipsStackWalk {
 
 	bool ScanForEntry(DebugInterface* cpu, StackFrame &frame, u32 entry, u32 &ra) {
 		// Let's hope there are no > 1MB functions on the PSP, for the sake of humanity...
-		const u32 LONGEST_FUNCTION = 1024 * 1024;
+		const u32 LONGEST_FUNCTION = 128 * 1024; // era 1MB: cada frame varria até 262k instruções na UI a cada pausa/step
 		// TODO: Check if found entry is in the same symbol?  Might be wrong sometimes...
 
 		int ra_offset = -1;

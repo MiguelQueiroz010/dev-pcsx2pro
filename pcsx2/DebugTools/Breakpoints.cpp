@@ -251,14 +251,21 @@ void CBreakPoints::ClearTemporaryBreakPoints()
 	if (breakPoints_.empty())
 		return;
 
-	for (int i = (int)breakPoints_.size()-1; i >= 0; --i)
+	// Apaga todos primeiro e só então faz UM Update(): antes era um Update()
+	// (flush do cache do recompilador + refresh completo da UI) por breakpoint
+	// temporário, e ainda ANTES de apagá-lo.
+	bool changed = false;
+	for (int i = (int)breakPoints_.size() - 1; i >= 0; --i)
 	{
 		if (breakPoints_[i].temporary)
 		{
-			Update(breakPoints_[i].cpu, breakPoints_[i].addr);
 			breakPoints_.erase(breakPoints_.begin() + i);
+			changed = true;
 		}
 	}
+
+	if (changed)
+		Update();
 }
 
 void CBreakPoints::ChangeBreakPointAddCond(BreakPointCpu cpu, u32 addr, const BreakPointCond &cond)

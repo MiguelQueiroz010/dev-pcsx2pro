@@ -582,6 +582,12 @@ u32 SymbolMap::GetFunctionStart(u32 address) const {
 	return INVALID_ADDRESS;
 }
 
+bool SymbolMap::ModuleHasFunctions(int moduleIndex) const {
+	std::lock_guard<std::recursive_mutex> guard(m_lock);
+	auto it = functions.lower_bound(std::make_pair(moduleIndex, 0u));
+	return it != functions.end() && it->first.first == moduleIndex;
+}
+
 u32 SymbolMap::GetFunctionSize(u32 startAddress) const {
 	std::lock_guard<std::recursive_mutex> guard(m_lock);
 	auto it = activeFunctions.find(startAddress);

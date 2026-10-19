@@ -501,15 +501,26 @@ static bool readStringAt(DebugInterface* cpu, u32 addr, std::string& out)
 	const u32 kMaxChars = 40;
 	out.clear();
 
-	if (addr < 0x1000 || !cpu->isValidAddress(addr))
-		return false;
+	// Só RAM do EE (0x0/0x2/0x3 e kseg 0x8-0xB): nunca registradores de hardware
+	// (0x1xxxxxxx), onde ler pode ter efeito colateral. Cobre também ponteiros
+	// lixo vindos de registradores "ao vivo".
+	auto ramPhys = [](u32 a) -> u32 {
+		u32 top = a >> 28;
+		if (top >= 0x8 && top <= 0xB)
+			return a & 0x1FFFFFFF;
+		if (top == 0x0 || top == 0x2 || top == 0x3)
+			return a & 0x0FFFFFFF;
+		return 0xFFFFFFFF;
+	};
 
 	for (u32 i = 0; i < kMaxChars + 1; i++)
 	{
-		if (!cpu->isValidAddress(addr + i))
+		u32 cur = addr + i;
+		u32 phys = ramPhys(cur);
+		if (phys < 0x1000 || phys >= 0x02000000 || !cpu->isValidAddress(cur))
 			return false;
 
-		u32 c = cpu->read8(addr + i) & 0xFF;
+		u32 c = cpu->read8(cur) & 0xFF;
 		if (c == 0)
 			return out.size() >= 3;
 		if (c < 0x20 || c >= 0x7F)
@@ -617,14 +628,45 @@ void CtrlDisassemblyView::render(wxDC& dc)
 		dc.DrawText(wxString(addressText, wxConvUTF8), pixelPositions.addressStart, rowY1 + 2);
 		drawArguments(dc, line, pixelPositions.argumentsStart, rowY1 + 2, textColor, currentArguments);
 
-		// Detector de String Lida: "li reg,<endereço>" que aponta pra uma string ASCII
-		// legível na memória ganha a string como comentário com fundo amarelo.
-		if (line.type == DISTYPE_MACRO && line.info.hasRelevantAddress && !line.info.isDataAccess)
+		// Detector de String Lida: qualquer instrução/macro que carregue um endereço
+		// que aponte pra uma string ASCII legível ganha a string como comentário com
+		// fundo amarelo. Considera:
+		//  - macros (lui+addiu/ori "li", lui+lw/lb/... com endereço imediato);
+		//  - qualquer instrução com base no $gp (addiu a0,gp,imm / lb v0,imm(gp) / ...),
+		//    já que $gp é constante e o endereço é confiável em qualquer linha;
+		//  - qualquer outra instrução com endereço relevante, mas só na linha do PC
+		//    atual (o valor "ao vivo" dos registradores só vale ali);
+		//  - loads/stores de palavra (lw/sw): se o conteúdo do endereço for um
+		//    ponteiro pra string, mostra com "->".
+		bool strCandidate = false;
+		u32 strAddr = 0;
+		if (line.info.hasRelevantAddress)
+		{
+			bool isGpBase = line.type == DISTYPE_OPCODE && ((line.info.encodedOpcode >> 21) & 0x1F) == 28 /* $gp */;
+			bool isCurrentPc = address == cpu->getPC();
+			if (line.type == DISTYPE_MACRO || isGpBase || isCurrentPc)
+			{
+				strCandidate = true;
+				strAddr = line.info.releventAddress;
+			}
+		}
+
+		if (strCandidate)
 		{
 			std::string str;
-			if (readStringAt(cpu, line.info.releventAddress, str))
+			bool viaPointer = false;
+			bool found = readStringAt(cpu, strAddr, str);
+			if (!found && line.info.isDataAccess && line.info.dataSize == 4 &&
+				(strAddr & 3) == 0 && cpu->isValidAddress(strAddr))
 			{
-				wxString comment = wxString::Format(L"; \"%s\"", wxString(str.c_str(), wxConvUTF8));
+				u32 pointee = cpu->read32(strAddr);
+				found = readStringAt(cpu, pointee, str);
+				viaPointer = found;
+			}
+
+			if (found)
+			{
+				wxString comment = wxString::Format(viaPointer ? L"; -> \"%s\"" : L"; \"%s\"", wxString(str.c_str(), wxConvUTF8));
 				int cx = pixelPositions.argumentsStart + (int)(line.params.size() + 2) * charWidth;
 				dc.SetBrush(wxBrush(wxColour(255, 255, 0)));
 				dc.SetPen(wxPen(wxColour(255, 255, 0)));
@@ -1428,23 +1470,27 @@ void CtrlDisassemblyView::copyInstructions(u32 startAddr, u32 endAddr, bool with
 
 	if (!withDisasm)
 	{
-		int instructionSize = 4;
-		int count = (endAddr - startAddr) / instructionSize;
-		int space = count * 32;
-		char* temp = new char[space];
+		const u32 instructionSize = 4;
+		// Limita a 2MB (como disassembleRange) e protege contra endAddr < startAddr
+		// (antes: contagem negativa -> new char[] gigante / crash).
+		u64 span = endAddr > startAddr ? (u64)(endAddr - startAddr) : 0;
+		if (span > 0x00200000)
+			span = 0x00200000;
 
-		char* p = temp;
-		for (u32 pos = startAddr; pos < endAddr; pos += instructionSize)
+		std::string temp;
+		temp.reserve((size_t)(span / instructionSize) * 10);
+		char word[16];
+		for (u64 off = 0; off < span; off += instructionSize)
 		{
-			p += sprintf(p, "%08X", cpu->read32(pos));
+			snprintf(word, sizeof(word), "%08X", cpu->read32(startAddr + (u32)off));
+			temp += word;
 
 			// Don't leave a trailing newline.
-			if (pos + instructionSize < endAddr)
-				p += sprintf(p, "\r\n");
+			if (off + instructionSize < span)
+				temp += "\r\n";
 		}
 
-		wxTheClipboard->SetData(new wxTextDataObject(wxString(temp, wxConvUTF8)));
-		delete[] temp;
+		wxTheClipboard->SetData(new wxTextDataObject(wxString(temp.c_str(), wxConvUTF8)));
 	}
 	else
 	{

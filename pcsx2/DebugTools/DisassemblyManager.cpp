@@ -51,6 +51,15 @@ void CallGraphIndex::Build(DebugInterface* cpu)
 			if (!cpu->isValidAddress(pos))
 				continue;
 
+			// Pré-filtro barato: só JAL (000011) e a família REGIMM (000001: BLTZAL/
+			// BGEZAL e variantes likely) podem ser "linked branch" direto. Evita
+			// chamar GetOpcodeInfo (que lê registradores etc.) em ~100% das
+			// instruções de todas as funções, o que travava a UI no 1º Call Tree.
+			u32 rawOp = cpu->read32(pos);
+			u32 majorOp = rawOp >> 26;
+			if (majorOp != 0x03 && majorOp != 0x01)
+				continue;
+
 			MIPSAnalyst::MipsOpcodeInfo opInfo = MIPSAnalyst::GetOpcodeInfo(cpu, pos);
 
 			// JAL apenas -- JALR (isBranchToRegister) tem alvo dinâmico e não dá
@@ -253,8 +262,21 @@ void DisassemblyManager::analyze(u32 address, u32 size = 1024)
 		{
 		case ST_FUNCTION:
 			{
+				if (info.size == 0 || info.size == 0xFFFFFFFF)
+				{
+					// Tamanho inválido: sem isso 'address' não avançava e o loop girava pra sempre.
+					address += 4;
+					break;
+				}
 				DisassemblyFunction* function = new DisassemblyFunction(cpu,info.address,info.size);
-				entries[info.address] = function;
+				auto existing = entries.find(info.address);
+				if (existing != entries.end())
+				{
+					delete existing->second;
+					existing->second = function;
+				}
+				else
+					entries[info.address] = function;
 				address = info.address+info.size;
 			}
 			break;
@@ -306,6 +328,7 @@ void DisassemblyManager::getLine(u32 address, bool insertSymbols, DisassemblyLin
 	if (currentSymGeneration != lastKnownSymGeneration)
 	{
 		clear();
+		callGraph.Invalidate();
 		lastKnownSymGeneration = currentSymGeneration;
 	}
 
@@ -375,7 +398,19 @@ u32 DisassemblyManager::getNthPreviousAddress(u32 address, int n)
 			it = findDisassemblyEntry(entries,address,false);
 		}
 	
+		if (!cpu->isAlive())
+			break;
+		u32 before = address;
 		analyze(address-127,128);
+		if (findDisassemblyEntry(entries,address,false) == entries.end())
+		{
+			// analyze não conseguiu criar entry pra esse endereço: anda 1 palavra
+			// pra trás em vez de repetir a mesma coisa pra sempre.
+			address = before - 4;
+			n--;
+			if (n <= 0)
+				break;
+		}
 	}
 	
 	return address-n*4;
@@ -402,7 +437,16 @@ u32 DisassemblyManager::getNthNextAddress(u32 address, int n)
 			it = findDisassemblyEntry(entries,address,false);
 		}
 
+		if (!cpu->isAlive())
+			break;
 		analyze(address);
+		if (findDisassemblyEntry(entries,address,false) == entries.end())
+		{
+			address += 4;
+			n--;
+			if (n <= 0)
+				break;
+		}
 	}
 
 	return address+n*4;

@@ -28,6 +28,10 @@
 
 #include <array>
 #include <algorithm>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
 
 bool GameDebuggerConfigManager::VerboseLogging = false;
 std::map<std::string, GameDebuggerConfigManager::SymFileFingerprint> GameDebuggerConfigManager::s_symFingerprints;
@@ -44,7 +48,14 @@ std::string GameDebuggerConfigManager::s_cachedRegionsDiscId = kUninitializedDis
 // linha renderizada -- o timestamp começa "zerado" para que a primeira chamada
 // depois do boot sempre rode a checagem real, independente do intervalo).
 std::chrono::steady_clock::time_point GameDebuggerConfigManager::s_lastSymCheckTime{};
-const std::chrono::milliseconds GameDebuggerConfigManager::kSymCheckInterval{200};
+const std::chrono::milliseconds GameDebuggerConfigManager::kSymCheckInterval{500};
+
+// Regiões cujo scan de funções (fallback heurístico + análise por JAL) já rodou nesta
+// "vida" dos símbolos. Antes isso rodava em TODO Apply (a cada tick do throttle, na
+// thread de UI), varrendo a região inteira de novo -- uma das causas das travadas.
+// É limpo quando os símbolos do módulo são descartados (.sym mudou/removido), em
+// InvalidateFileCache() e em ApplyForCurrentGame() (Apply completo/troca de jogo).
+static std::set<std::string> s_analyzedRegions;
 
 // Detailed step trace, only emitted when VerboseLogging is enabled. Console.WriteLn/
 // Console.Warning already get mirrored into PCSX2's on-disk log when logging is
@@ -79,6 +90,68 @@ static u32 Crc32(const u8* data, size_t len)
 	for (size_t i = 0; i < len; i++)
 		crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
 	return crc ^ 0xFFFFFFFFu;
+}
+
+// Cache da assinatura (primeiros bytes) dos arquivos BIN de overlay. Antes o BIN era
+// aberto e lido do disco em TODO Apply (a cada tick do throttle, por região). Agora
+// só relê quando mtime/tamanho mudam; a interface imita o pedaço de wxFFile usado.
+namespace
+{
+	struct BinSigCacheEntry
+	{
+		long long mtime = 0;
+		long long size = -1;
+		std::vector<u8> head;
+	};
+	std::map<std::string, BinSigCacheEntry> s_binSigCache;
+
+	class CachedBinFile
+	{
+	public:
+		explicit CachedBinFile(const std::string& path)
+		{
+			wxFileName fn(wxString(path.c_str(), wxConvUTF8));
+			if (!fn.FileExists())
+				return;
+
+			wxDateTime modTime = fn.GetModificationTime();
+			long long mtime = modTime.IsValid() ? (long long)modTime.GetValue().ToDouble() : 0;
+			long long size = (long long)fn.GetSize().GetValue();
+
+			BinSigCacheEntry& e = s_binSigCache[path];
+			if (e.size != size || e.mtime != mtime)
+			{
+				wxFFile f(wxString(path.c_str(), wxConvUTF8), L"rb");
+				if (!f.IsOpened())
+				{
+					s_binSigCache.erase(path);
+					return;
+				}
+				e.head.assign(kOverlaySignatureBytes, 0);
+				size_t n = f.Read(e.head.data(), kOverlaySignatureBytes);
+				e.head.resize(n);
+				e.size = size;
+				e.mtime = mtime;
+			}
+			m_entry = &e;
+			m_len = size;
+		}
+
+		bool IsOpened() const { return m_entry != nullptr; }
+		ssize_t Length() const { return (ssize_t)m_len; }
+		size_t Read(void* dst, size_t n)
+		{
+			if (!m_entry)
+				return 0;
+			size_t k = std::min(n, m_entry->head.size());
+			memcpy(dst, m_entry->head.data(), k);
+			return k;
+		}
+
+	private:
+		BinSigCacheEntry* m_entry = nullptr;
+		long long m_len = 0;
+	};
 }
 
 bool GameDebuggerConfigManager::SymFileChanged(const std::string& cacheKey, const std::string& symFilePath, SymFileFingerprint& outFingerprint)
@@ -127,6 +200,7 @@ void GameDebuggerConfigManager::InvalidateFileCache()
 {
 	size_t count = s_symFingerprints.size();
 	s_symFingerprints.clear();
+	s_analyzedRegions.clear();
 	GDBG_LOG("[GameDebugger] InvalidateFileCache: cleared %zu cached SYM fingerprint(s); next Apply will reparse everything.", count);
 }
 
@@ -532,7 +606,7 @@ void GameDebuggerConfigManager::ApplyRegionsToCpu(DebugInterface* cpu, const std
 					GDBG_LOG("[GameDebugger]   -> Comparing '%s' against memory at 0x%08X...",
 						reg.binFilePath.c_str(), reg.startAddress);
 
-					wxFFile file(wxString(reg.binFilePath.c_str(), wxConvUTF8), L"rb");
+					CachedBinFile file(reg.binFilePath);
 					if (!file.IsOpened())
 					{
 						Console.Warning("[GameDebugger]   -> BIN file could not be opened: '%s'", reg.binFilePath.c_str());
@@ -661,7 +735,7 @@ void GameDebuggerConfigManager::ApplyRegionsToCpu(DebugInterface* cpu, const std
 						{
 							GDBG_LOG("[GameDebugger]   -> SYM for '%s' changed on disk: clearing previously loaded symbols (module=%d) before reparsing.",
 								reg.name.c_str(), existingModule);
-							cpu->GetSymbolMap().ClearModuleSymbols(existingModule);
+							{ cpu->GetSymbolMap().ClearModuleSymbols(existingModule); s_analyzedRegions.erase(reg.name); }
 						}
 
 						GDBG_LOG("[GameDebugger]   -> LoadNocashSym '%s' (baseOffset=0, absolute addresses)",
@@ -697,7 +771,7 @@ void GameDebuggerConfigManager::ApplyRegionsToCpu(DebugInterface* cpu, const std
 					{
 						GDBG_LOG("[GameDebugger]   -> SYM path cleared for '%s': purging previously loaded symbols (module=%d).",
 							reg.name.c_str(), existingModule);
-						cpu->GetSymbolMap().ClearModuleSymbols(existingModule);
+						{ cpu->GetSymbolMap().ClearModuleSymbols(existingModule); s_analyzedRegions.erase(reg.name); }
 					}
 					s_symFingerprints.erase(cacheIt);
 				}
@@ -716,22 +790,16 @@ void GameDebuggerConfigManager::ApplyRegionsToCpu(DebugInterface* cpu, const std
 			if (shouldActivate && size > 0 && !reg.name.empty())
 			{
 				int moduleIdx = cpu->GetSymbolMap().GetModuleIndexByName(reg.name.c_str());
-				if (moduleIdx > 0)
+				// Só na primeira análise desta região (ver s_analyzedRegions).
+				bool firstAnalysis = (moduleIdx > 0) && s_analyzedRegions.insert(reg.name).second;
+				if (firstAnalysis)
 				{
-					bool hasAnyFunction = false;
-					for (const SymbolEntry& fn : cpu->GetSymbolMap().GetAllSymbols(ST_FUNCTION))
-					{
-						if (fn.moduleIndex == moduleIdx)
-						{
-							hasAnyFunction = true;
-							break;
-						}
-					}
+					bool hasAnyFunction = cpu->GetSymbolMap().ModuleHasFunctions(moduleIdx);
 
 					if (!hasAnyFunction)
 					{
 						GDBG_LOG("[GameDebugger]   -> No ST_FUNCTION symbols for active region '%s' (module=%d), running heuristic MIPSAnalyst::ScanForFunctions fallback over 0x%08X-0x%08X.",
-							reg.name.c_str(), moduleIdx, reg.startAddress, reg.startAddress + size - 1);
+						reg.name.c_str(), moduleIdx, reg.startAddress, reg.startAddress + size - 1);
 
 						MIPSAnalyst::ScanForFunctions(cpu->GetSymbolMap(), reg.startAddress, reg.startAddress + size - 1, /*insertSymbols=*/true);
 						cpu->GetSymbolMap().UpdateActiveSymbols();
@@ -748,13 +816,13 @@ void GameDebuggerConfigManager::ApplyRegionsToCpu(DebugInterface* cpu, const std
 				// que só reconhecer a forma do prólogo, e por só ADICIONAR
 				// (nunca redimensionar/remover o que já existe) é seguro
 				// rodar em toda Apply sem risco de atropelar um .sym real.
-				if (moduleIdx > 0)
+				if (firstAnalysis)
 				{
 					int added = AnalyzeCallTargetsInRegion(cpu, moduleIdx, reg.startAddress, reg.startAddress + size);
 					if (added > 0)
 					{
 						GDBG_LOG("[GameDebugger]   -> AnalyzeCallTargets: added %d function(s) for region '%s' via JAL+jr $ra analysis.",
-							added, reg.name.c_str());
+						added, reg.name.c_str());
 						cpu->GetSymbolMap().UpdateActiveSymbols();
 					}
 				}
