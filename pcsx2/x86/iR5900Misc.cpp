@@ -259,6 +259,32 @@ void ReportUnknownOp(const char* kind)
 	const u64 key = ((u64)badPc << 32) | code;
 	if (!s_seen.insert(key).second)
 		return; // mesmo pc+opcode ja reportado
+
+	// Falso positivo classico: o recompilador NAO encerra o bloco em SYSCALL (recSYSCALL tem
+	// "//g_branch = 2"), entao continua compilando os nops/dados que ficam depois do stub
+	// (ex.: li v1,0x23 ; syscall  == ExitThread em 0x100180). Em tempo de execucao o syscall
+	// muda o pc e esse "codigo" nunca roda. Se so ha nops entre um SYSCALL e a instrucao
+	// ruim, registra 1 linha e nao polui o log com o relatorio completo.
+	{
+		u32 a = badPc;
+		for (int n = 0; n < 256 && a >= 4; n++)
+		{
+			a -= 4;
+			if (!r5900Debug.isValidAddress(a))
+				break;
+			const u32 w = r5900Debug.read32(a);
+			if (w == 0)
+				continue; // nop
+			if ((w & 0xFC00003F) == 0x0000000C) // SYSCALL
+			{
+				Console.WriteLn("EE: [UnkOp] %s op %08x em %08x ignorado (benigno): compile-ahead depois do SYSCALL em %08x %s",
+					kind, code, badPc, a, UnkSymName(a).c_str());
+				return;
+			}
+			break;
+		}
+	}
+
 	if (s_reports >= maxReports)
 	{
 		if ((++s_suppressed % 256) == 1)
