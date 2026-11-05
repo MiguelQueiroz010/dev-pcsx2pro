@@ -19,6 +19,15 @@
 #include "iR5900.h"
 #include "R5900OpcodeTables.h"
 
+#include "DebugTools/DebugInterface.h"
+#include "DebugTools/MipsStackWalk.h"
+#include "DebugTools/SymbolMap.h"
+
+#include <cstdio>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
 using namespace x86Emitter;
 
 namespace R5900 {
